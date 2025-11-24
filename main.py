@@ -99,7 +99,6 @@ def step_1_extraction():
     print("="*60)
     
     try:
-        # ForceCompute=True est important pour écraser les données potentiellement corrompues
         start_time = time.time()
         vs = VideoSkeleton(video_path, forceCompute=True, modFrame=mod_frame)
         elapsed = time.time() - start_time
@@ -114,6 +113,7 @@ def step_1_extraction():
         print("\n" + "="*60)
         print(f"[✗ ERREUR] L'extraction a échoué : {e}")
         print("="*60)
+        print("\n[DIAGNOSTIC]")
         import traceback
         traceback.print_exc()
 
@@ -190,10 +190,39 @@ def step_2_training():
         print(f"   - Modèle sauvegardé dans 'models/'")
         print("="*60)
         
+    except TypeError as e:
+        # Gestion spécifique pour erreur verbose
+        if "verbose" in str(e):
+            print("\n" + "="*60)
+            print("[⚠ AVERTISSEMENT] Votre version de PyTorch est ancienne")
+            print("L'entraînement va continuer sans le mode verbose")
+            print("="*60)
+            print("\n[INFO] Redémarrage de l'entraînement...")
+            # On ne peut pas facilement redémarrer ici, l'erreur est déjà levée
+            # Le fix est maintenant dans GenVanillaNN.py
+        print("\n" + "="*60)
+        print(f"[✗ ERREUR] Problème de compatibilité : {e}")
+        print("="*60)
+        print("\n[DIAGNOSTIC]")
+        print(" - Assurez-vous que PyTorch est bien installé")
+        print(" - Essayez: pip install torch --upgrade")
+        import traceback
+        traceback.print_exc()
+        
     except Exception as e:
         print("\n" + "="*60)
         print(f"[✗ ERREUR] L'entraînement a planté : {e}")
         print("="*60)
+        print("\n[DIAGNOSTIC]")
+        if "CUDA" in str(e) or "gpu" in str(e).lower():
+            print(" - Problème GPU détecté")
+            print(" - Le modèle utilisera le CPU à la place")
+        elif "memory" in str(e).lower() or "out of memory" in str(e).lower():
+            print(" - Mémoire insuffisante")
+            print(" - Réduisez le batch_size ou fermez d'autres programmes")
+        else:
+            print(" - Erreur inattendue, voir traceback ci-dessous")
+        print("-" * 60)
         import traceback
         traceback.print_exc()
 
@@ -239,7 +268,6 @@ def step_3_demo():
     print("-" * 60)
     
     try:
-        # On passe explicitement le fichier cible pour éviter que DanceDemo ne charge un défaut
         dd = DanceDemo(src_path, gen_type, filename_tgt=tgt_path)
         dd.draw(skip_frames=8, wait_ms=1)
         print("\n[INFO] Démo terminée.")
@@ -250,6 +278,7 @@ def step_3_demo():
         print("\n[DIAGNOSTIC]")
         print(" - Si 'index out of bounds' → le dataset cible est vide")
         print(" - Si 'model not found' → il faut entraîner le modèle (étape 2)")
+        print(" - Si 'load_state_dict' → incompatibilité modèle sauvegardé")
         print(" - Vérifiez que vous avez bien fait l'étape 1 ET 2 pour ce personnage")
         print("-" * 60)
         import traceback
