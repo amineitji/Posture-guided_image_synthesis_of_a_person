@@ -2,176 +2,77 @@ import os
 import numpy as np
 import cv2
 import mediapipe as mp
-#import gc
+from collections import deque
 
 from Vec3 import *
 
-#mp_pose = mp.solutions.pose
-#mp_pose = mp.solutions.pose
-#mp_pose_detector = mp.solutions.pose.Pose()     # en global pour éviter de le recréer à chaque fois dans la classe, sinon mettre en static
-
 mp_pose_detector = mp.solutions.pose.Pose(
-            static_image_mode=False,            # False is for video sequence
+            static_image_mode=False,
             model_complexity=2,
             smooth_landmarks=True,
             enable_segmentation=False,
-            smooth_segmentation=False,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5)
 
 
 class Skeleton:
-    """ class with a skeleton
-        tab de Vec3
-
-        # Full skeleton
-        https://developers.google.com/mediapipe/solutions/vision/pose_landmarker
-        0 - nose
-        1 - left eye (inner)
-        2 - left eye
-        3 - left eye (outer)
-        4 - right eye (inner)
-        5 - right eye
-        6 - right eye (outer)
-        7 - left ear
-        8 - right ear
-        9 - mouth (left)
-        10 - mouth (right)
-        11 - left shoulder
-        12 - right shoulder
-        13 - left elbow
-        14 - right elbow
-        15 - left wrist
-        16 - right wrist
-        17 - left pinky
-        18 - right pinky
-        19 - left index
-        20 - right index
-        21 - left thumb
-        22 - right thumb
-        23 - left hip
-        24 - right hip
-        25 - left knee
-        26 - right knee
-        27 - left ankle
-        28 - right ankle
-        29 - left heel
-        30 - right heel
-        31 - left foot index
-        32 - right foot index
-
-        # Reduced skeleton
-        ==> reduce 0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28
-        0 head
-        1 left shoulder
-        2 right shoulder
-        3 left elbow
-        4 right elbow
-        5 left wrist
-        6 right wrist
-        7 left hip
-        8 right hip
-        9 left knee
-        10 right knee
-        11 left ankle
-        12 right ankle
-    """
+    """ class with a skeleton """
     reduce_indice  = [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
     dim = 33
     full_dim      = 3*dim
     reduced_dim   = len(reduce_indice)*2
 
     colors_rgb = np.array([
-                    [255, 0, 0],     # Rouge
-                    [0, 255, 0],     # Vert
-                    [0, 0, 255],     # Bleu
-                    [255, 255, 0],   # Jaune
-                    [255, 0, 255],   # Magenta
-                    [0, 255, 255],   # Cyan
-                    [128, 0, 0],     # Marron
-                    [0, 128, 0],     # Vert foncé
-                    [0, 0, 128],     # Bleu foncé
-                    [255, 128, 0],   # Orange
-                    [128, 0, 128],   # Pourpre
-                    [128, 128, 0],   # Olive
-                    [0, 128, 128],   # Sarcelle
-                    [128, 128, 128], # Gris
-                    [192, 192, 192], # Gris clair
-                    [255, 165, 0],   # Or
-                    [165, 42, 42],   # Brun
-                    [0, 128, 192],   # Bleu acier
-                    [128, 0, 128],   # Indigo
-                    [128, 0, 0],     # Acajou
-                    [128, 128, 0],   # Olive
-                    [0, 128, 0],     # Vert foncé
-                    [0, 128, 128],   # Sarcelle
-                    [0, 0, 128],     # Bleu foncé
-                    [0, 165, 255],   # Bleu royal
-                    [165, 42, 42],   # Brun
-                    [255, 140, 0],   # Orange rouge
-                    [0, 250, 154],   # Vert clair
-                    [75, 0, 130],    # Indigo foncé
-                    [0, 255, 255],   # Cyan clair
-                    [218, 112, 214], # Orchidée
-                    [210, 105, 30],  # Chocolat
-                    [240, 230, 140], # Kaki
-                    [255, 20, 147],  # Rose profond
+                    [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0],
+                    [255, 0, 255], [0, 255, 255], [128, 0, 0], [0, 128, 0],
+                    [0, 0, 128], [255, 128, 0], [128, 0, 128], [128, 128, 0],
+                    [0, 128, 128], [128, 128, 128], [192, 192, 192], [255, 165, 0],
+                    [165, 42, 42], [0, 128, 192], [128, 0, 128], [128, 0, 0],
+                    [128, 128, 0], [0, 128, 0], [0, 128, 128], [0, 0, 128],
+                    [0, 165, 255], [165, 42, 42], [255, 140, 0], [0, 250, 154],
+                    [75, 0, 130], [0, 255, 255], [218, 112, 214], [210, 105, 30],
+                    [240, 230, 140], [255, 20, 147],
                 ], dtype=np.uint8)
-
 
     def __init__(self, ske=None):
         if ske is not None:
             self.ske = ske
         else:
-            self.ske = np.empty( Skeleton.dim, dtype=Vec3)            # 33 is the size of mediapipe skeleton
+            self.ske = np.empty(Skeleton.dim, dtype=Vec3)
             for i in range(Skeleton.dim):
                 self.ske[i] = Vec3(0,0,0)
 
-
     def __str__(self):          
         return str(self.ske)        
-
     
     def __array__(self, dtype=None):
-        """ return skeleton as a numpy array of float (full skeleton) """
-        return np.vstack( self.ske ).astype(float)
+        return np.vstack(self.ske).astype(float)
     
     def toarray(self, reduced=False):
-        """ return skeleton as a numpy array of float, if reduced is True, keep only 13 minimals joints """
         if reduced:
-            return np.vstack( self.ske[self.reduce_indice] ).astype(float)[:, :2]
+            return np.vstack(self.ske[self.reduce_indice]).astype(float)[:, :2]
         else:
-            return np.vstack( self.ske ).astype(float)
+            return np.vstack(self.ske).astype(float)
 
     def reduce(self):
         return self.toarray(reduced=True)
     
-
     def fromImage(self, image):     
-        """ get skeleton from image """
-        #results = self.pose.process(image)
         results = mp_pose_detector.process(image)
         if results.pose_landmarks is None:
             return False
         if results.pose_landmarks:
             for index, landmark in enumerate(results.pose_landmarks.landmark):                    
                 self.ske[index] = Vec3(landmark.x, landmark.y, landmark.z)
-        ok = len(results.pose_landmarks.landmark)==Skeleton.dim
-        results.pose_landmarks.Clear()      # free memory of mo
-        # del results
-        # gc.collect()
+        ok = len(results.pose_landmarks.landmark) == Skeleton.dim
         return ok
 
-
     def crop(self, x,y,w,h):
-        """ crop skeleton """
         for i in range(Skeleton.dim):
             self.ske[i].x = (self.ske[i].x - x) / w
             self.ske[i].y = (self.ske[i].y - y) / h
 
-
     def boundingBox(self):
-        """ get bounding box of skeleton """
         minx, maxx = 1, 0
         miny, maxy = 1, 0
         for i in range(Skeleton.dim):
@@ -181,39 +82,29 @@ class Skeleton:
             maxy = max(maxy, self.ske[i].y)
         return minx, miny, maxx, maxy
 
-
-    def distance(self, ske):        # TP-TODO
-        """ distance between two skeletons """
+    def distance(self, ske):
         d = 0.0
-        # Gérer le cas où ske est un numpy array (chargé depuis pkl)
         if isinstance(ske, np.ndarray):
-            # Conversion en objets comparables
             ske_array = np.vstack(ske).astype(float)
             self_array = np.vstack(self.ske).astype(float)
             d = np.linalg.norm(self_array - ske_array)
         else:
-            # Cas normal : objet Skeleton
             for i in range(Skeleton.dim):
-                d += norm( self.ske[i]-ske.ske[i])
+                d += np.sqrt((self.ske[i].x - ske.ske[i].x)**2 + (self.ske[i].y - ske.ske[i].y)**2 + (self.ske[i].z - ske.ske[i].z)**2)
         return d
 
     def draw(self, image):
-        """ draw skeleton on image """
         image.flags.writeable = True
-        #image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
         height,width,_ = image.shape
         for i in range(Skeleton.dim):
             x, y = int(self.ske[i].x * width), int(self.ske[i].y * height)
             cv2.circle(image, (x,y), 3, Skeleton.colors_rgb[i].tolist() , -1)
-            #cv2.circle(image, (x,y), 3, (0, 0, 255), -1)
-            #cv2.line(image, (100, 100), (500, 500), (0, 255, 0), 2)
         Skeleton.draw_reduced(self.reduce(), image)
 
     def CoM(self,w=1,h=1):
         moyenne = self.ske.mean()
         moyenne = np.array( [moyenne[0] * w, moyenne[1] * h ] )
         return moyenne.astype(int)
-
 
     @staticmethod
     def neck(ske,w,h):
@@ -237,56 +128,53 @@ class Skeleton:
 
     @staticmethod
     def draw_reduced(skr, image):
-        """ draw reduced skeleton skr (numpy) on image 
-                # 0 head
-                # 1 left shoulder
-                # 2 right shoulder
-                # 3 left elbow
-                # 4 right elbow
-                # 5 left wrist
-                # 6 right wrist
-                # 7 left hip
-                # 8 right hip
-                # 9 left knee
-                # 10 right knee
-                # 11 left ankle
-                # 12 right ankle
-        """
         image.flags.writeable = True
         h,w,_ = image.shape
+        # Protection contre des coordonnées hors limites ou NaN
+        if np.isnan(skr).any(): return
+        
         pelvis = tuple(Skeleton.pelvis(skr,w,h))
         neck   = tuple(Skeleton.neck(skr,w,h))
-        cv2.line(image, pelvis, neck, Skeleton.color(0), 4)
-        cv2.line(image, Skeleton.joint(skr,w,h,3), Skeleton.joint(skr,w,h,1), Skeleton.color(1), 4)
-        cv2.line(image, Skeleton.joint(skr,w,h,5), Skeleton.joint(skr,w,h,3), Skeleton.color(2), 4)
-        cv2.line(image, Skeleton.joint(skr,w,h,2), Skeleton.joint(skr,w,h,4), Skeleton.color(3), 4)
-        cv2.line(image, Skeleton.joint(skr,w,h,4), Skeleton.joint(skr,w,h,6), Skeleton.color(4), 4)
-        cv2.line(image, neck, Skeleton.joint(skr,w,h,1), Skeleton.color(5), 4)
-        cv2.line(image, neck, Skeleton.joint(skr,w,h,2), Skeleton.color(6), 4)
-        cv2.line(image, neck, Skeleton.joint(skr,w,h,0), Skeleton.color(7), 4)
-        cv2.line(image, Skeleton.joint(skr,w,h,7), pelvis, Skeleton.color(8), 4)
-        cv2.line(image, Skeleton.joint(skr,w,h,8), pelvis, Skeleton.color(9), 4)
-        cv2.line(image, Skeleton.joint(skr,w,h,8), Skeleton.joint(skr,w,h,10), Skeleton.color(10), 4)
-        cv2.line(image, Skeleton.joint(skr,w,h,10), Skeleton.joint(skr,w,h,12), Skeleton.color(11), 4)
-        cv2.line(image, Skeleton.joint(skr,w,h,7), Skeleton.joint(skr,w,h,9), Skeleton.color(12), 4)
-        cv2.line(image, Skeleton.joint(skr,w,h,9), Skeleton.joint(skr,w,h,11), Skeleton.color(13), 4)
+        
+        lines = [
+            (pelvis, neck, 0),
+            (Skeleton.joint(skr,w,h,3), Skeleton.joint(skr,w,h,1), 1),
+            (Skeleton.joint(skr,w,h,5), Skeleton.joint(skr,w,h,3), 2),
+            (Skeleton.joint(skr,w,h,2), Skeleton.joint(skr,w,h,4), 3),
+            (Skeleton.joint(skr,w,h,4), Skeleton.joint(skr,w,h,6), 4),
+            (neck, Skeleton.joint(skr,w,h,1), 5),
+            (neck, Skeleton.joint(skr,w,h,2), 6),
+            (neck, Skeleton.joint(skr,w,h,0), 7),
+            (Skeleton.joint(skr,w,h,7), pelvis, 8),
+            (Skeleton.joint(skr,w,h,8), pelvis, 9),
+            (Skeleton.joint(skr,w,h,8), Skeleton.joint(skr,w,h,10), 10),
+            (Skeleton.joint(skr,w,h,10), Skeleton.joint(skr,w,h,12), 11),
+            (Skeleton.joint(skr,w,h,7), Skeleton.joint(skr,w,h,9), 12),
+            (Skeleton.joint(skr,w,h,9), Skeleton.joint(skr,w,h,11), 13),
+        ]
+        
+        for p1, p2, col_idx in lines:
+            # Conversion explicite en tuple d'entiers pour OpenCV
+            pt1 = (int(p1[0]), int(p1[1]))
+            pt2 = (int(p2[0]), int(p2[1]))
+            cv2.line(image, pt1, pt2, Skeleton.color(col_idx), 4)
 
-
-
-if __name__ == '__main__':
-    s = Skeleton()
-    print("Current Working Directory:", os.getcwd())
-    image = cv2.imread("data/test.jpg")
-    if image is None:
-        print('Lecture de l\'image a échoué.')
-    #image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    s.fromImage(image)
-    #print(s)
-    print( "landmarks:", s )
-    print( "landmarks as np:", s.__array__() )
-    print( "landmarks as np:", s.__array__(reduced=True) )
-
-    s.draw(image)
-    cv2.imshow('Image', image)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+class SkeletonSmoother:
+    """ Average moving filter for skeleton stability """
+    def __init__(self, window_size=5):
+        self.window_size = window_size
+        self.history = deque(maxlen=window_size)
+    
+    def update(self, ske):
+        # On stocke uniquement la version réduite (numpy array)
+        if isinstance(ske, Skeleton):
+            current = ske.toarray(reduced=True)
+        else:
+            current = ske
+            
+        self.history.append(current)
+        
+        # Moyenne temporelle
+        arr = np.array(self.history)
+        smoothed = np.mean(arr, axis=0)
+        return smoothed

@@ -1,106 +1,116 @@
 import numpy as np
 import cv2
 import os
-import sys
+import time
 
 from VideoSkeleton import VideoSkeleton
-from VideoSkeleton import combineTwoImages
 from VideoReader import VideoReader
-from Skeleton import Skeleton
+from Skeleton import Skeleton, SkeletonSmoother
 from GenNearest import GenNeirest
-from GenVanillaNN import *
-from GenGAN import *
+from GenVanillaNN import GenVanillaNN
+from GenGAN import GenGAN
 
 class DanceDemo:
-    """ class that run a demo of the dance. """
     def __init__(self, filename_src, typeOfGen=1, filename_tgt=None):
-        # --- MODIF: Gestion flexible de la cible ---
-        if filename_tgt is None:
-            # Défaut historique, mais risqué si le fichier n'existe pas
-            filename_tgt = "data/processed/taichi1.pkl"
-            
-        print(f"DanceDemo: Source={filename_src} Cible={filename_tgt}")
+        if filename_tgt is None: filename_tgt = "data/processed/taichi1.pkl"
         
-        # On charge le dataset cible (qui doit exister dans data/processed)
-        if not os.path.exists(filename_tgt):
-             print(f"ERREUR: Fichier cible introuvable: {filename_tgt}")
-             # Fallback sur ce qui existe
-             import glob
-             pkls = glob.glob("data/processed/*.pkl")
-             if pkls:
-                 filename_tgt = pkls[0]
-                 print(f" -> Utilisation de {filename_tgt} à la place.")
-        
+        print(f"[DanceDemo] Chargement...")
         self.target = VideoSkeleton(filename_tgt)
         self.source = VideoReader(filename_src)
-        
-        if self.target.skeCount() == 0:
-            raise ValueError("Dataset vide ! Lancez l'extraction (Option 1) sur la vidéo cible.")
+        self.smoother = SkeletonSmoother(window_size=5)
 
-        if typeOfGen==1:
-            print("Generator: GenNeirest")
+        if typeOfGen == 1:
             self.generator = GenNeirest(self.target)
-        elif typeOfGen==2:
-            print("Generator: GenVanillaNN (Vector)")
+            self.model_name = "Nearest"
+        elif typeOfGen == 2:
             self.generator = GenVanillaNN(self.target, loadFromFile=True, optSkeOrImage=1)
-        elif typeOfGen==3:
-            print("Generator: GenVanillaNN (Image)")
+            self.model_name = "VanillaVec"
+        elif typeOfGen == 3:
             self.generator = GenVanillaNN(self.target, loadFromFile=True, optSkeOrImage=2)
-        elif typeOfGen==4:
-            print("Generator: GenGAN")
+            self.model_name = "VanillaUnet"
+        elif typeOfGen == 4:
             self.generator = GenGAN(self.target, loadFromFile=True)
+            self.model_name = "WGAN-GP"
         else:
-            print("DanceDemo: typeOfGen error!!!")
+            raise ValueError("Type inconnu")
 
-    def draw(self, skip_frames=4, wait_ms=1):
-        """
-        skip_frames: traiter 1 frame sur X (4 = plus rapide, 1 = toutes les frames)
-        wait_ms: délai entre frames (1 = rapide, 30 = normal)
-        """
+    def draw(self):
         ske = Skeleton()
-        # Image d'erreur rouge
-        image_err = np.zeros((256, 256, 3), dtype=np.uint8)
-        image_err[:, :] = (0, 0, 255)
+        display_size = 256
+        font = cv2.FONT_HERSHEY_SIMPLEX
         
-        print(f"[DEMO] Vitesse: 1 frame sur {skip_frames}, délai {wait_ms}ms")
+        # --- REGLAGE VITESSE ---
+        # 1 = Toutes les frames (Lent)
+        # 3 = Vitesse normale (Saute des frames pour garder le rythme)
+        speed_factor = 3  
+        
+        print(f"[DEMO] Vitesse x{speed_factor}. Appuyez sur 'q' pour quitter.")
+        
+        fps_time = time.time()
+        frames_processed = 0
+        fps_display = 0
 
-        for i in range(self.source.getTotalFrames()):
+        while True:
+            # 1. AVANCE RAPIDE (Frame Skipping)
+            # On "consomme" les images précédentes sans les décoder pour aller vite
+            for _ in range(speed_factor - 1):
+                self.source.cap.grab() 
+
+            # 2. Lecture de la frame actuelle
             image_src = self.source.readFrame()
             if image_src is None: break
             
-            # On peut accélérer en sautant des frames
-            if i % skip_frames == 0:
-                # On adapte les dims cibles à la source pour l'extraction
-                self.target.setWidthHeigh(image_src, -1, 1.0)
+            # 3. Traitement
+            self.target.setWidthHeigh(image_src, -1, 1.0)
+            isSke, image_src_crop, ske = self.target.cropAndSke(image_src, ske)
+            
+            if isSke:
+                # Lissage
+                smoothed_coords = self.smoother.update(ske)
                 
-                isSke, image_src_crop, ske = self.target.cropAndSke(image_src, ske)
-                if isSke:
-                    # Visualisation: squelette sur source
-                    ske.draw(image_src_crop)
-                    
-                    # GENERATION
-                    image_tgt = self.generator.generate(ske)
-                    
-                    # Mise à l'échelle pour affichage
-                    image_tgt = cv2.resize(image_tgt, (128, 128))
-                    image_src_crop = cv2.resize(image_src_crop, (128, 128))
-                    
-                    image_combined = combineTwoImages(image_src_crop, image_tgt)
-                    
-                else:
-                    image_src_resized = cv2.resize(image_src, (128, 128))
-                    image_err_resized = cv2.resize(image_err, (128, 128))
-                    image_combined = combineTwoImages(image_src_resized, image_err_resized)
-                
-                image_combined = cv2.resize(image_combined, (512, 256))
-                cv2.imshow('Dance Demo', image_combined)
-                
-                key = cv2.waitKey(wait_ms)
-                if key & 0xFF == ord('q'):
-                    break
-        cv2.destroyAllWindows()
+                # Mise à jour squelette pour génération
+                for i, idx_full in enumerate(Skeleton.reduce_indice):
+                    ske.ske[idx_full].x = smoothed_coords[i, 0]
+                    ske.ske[idx_full].y = smoothed_coords[i, 1]
 
-if __name__ == '__main__':
-    # Pour test autonome
-    ddemo = DanceDemo("data/raw/taichi2.mp4", 1)
-    ddemo.draw()
+                # Génération IA
+                image_gen = self.generator.generate(ske)
+                
+                # --- INTERFACE GRAPHIQUE ---
+                # Redimensionnement
+                p1 = cv2.resize(image_src_crop, (display_size, display_size))
+                p3 = cv2.resize(image_gen, (display_size, display_size))
+                
+                # Création image squelette (noir)
+                p2 = np.zeros((display_size, display_size, 3), dtype=np.uint8)
+                Skeleton.draw_reduced(smoothed_coords, p2)
+                
+                # Assemblage
+                combined = np.hstack((p1, p2, p3))
+                
+                # Bandeau Header
+                header = np.zeros((35, combined.shape[1], 3), dtype=np.uint8)
+                final_display = np.vstack((header, combined))
+                
+                # Textes
+                col = (255, 255, 255)
+                cv2.putText(final_display, f"FPS: {fps_display}", (10, 22), font, 0.5, (0, 255, 0), 1)
+                cv2.putText(final_display, "SOURCE VIDEO", (80, 22), font, 0.5, col, 1)
+                cv2.putText(final_display, "SQUELETTE", (80+display_size, 22), font, 0.5, col, 1)
+                cv2.putText(final_display, f"GENERATION ({self.model_name})", (60+display_size*2, 22), font, 0.5, col, 1)
+
+                cv2.imshow('Deep Dance Transfer', final_display)
+                
+                # Calcul FPS Réel
+                frames_processed += 1
+                if time.time() - fps_time >= 1.0:
+                    fps_display = frames_processed
+                    frames_processed = 0
+                    fps_time = time.time()
+
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+            else:
+                pass # Si pas de squelette, on continue sans afficher (évite clignotement)
+
+        cv2.destroyAllWindows()

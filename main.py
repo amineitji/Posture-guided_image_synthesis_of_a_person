@@ -1,11 +1,12 @@
 import sys
 import os
 import time
+import glob
 
 # =============================================================================
-# CONFIGURATION DU CHEMIN PYTHON
+# CONFIGURATION
 # =============================================================================
-# Les fichiers Python sont dans le dossier 'code/'
+# On s'assure que Python trouve les fichiers dans le dossier 'code'
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'code'))
 
 try:
@@ -13,322 +14,259 @@ try:
     from DanceDemo import DanceDemo
     from GenVanillaNN import GenVanillaNN
     from GenGAN import GenGAN
+    # Optionnel
     try:
         from GenNearest import GenNeirest
     except ImportError:
         GenNeirest = None
         
 except ImportError as e:
-    print("\n/!\\ ERREUR CRITIQUE D'IMPORT /!\\")
-    print(f"Détail : {e}")
-    print("Vérifiez que tous les fichiers Python sont bien dans le dossier 'code/'")
-    print("Fichiers requis: code/VideoSkeleton.py, code/DanceDemo.py, etc.")
-    print(f"\nChemin actuel : {os.getcwd()}")
-    print(f"Dossier code existe : {os.path.exists('code')}")
+    print("\n" + "!"*60)
+    print(" ERREUR CRITIQUE : Fichiers manquants")
+    print(f" Détail : {e}")
+    print(" Vérifiez que le dossier 'code/' contient bien tous les scripts.")
+    print("!"*60)
     sys.exit(1)
 
 # =============================================================================
-# UTILITAIRES D'INTERFACE
+# OUTILS D'INTERFACE
 # =============================================================================
 
 def clear():
-    """Nettoie l'écran (Windows/Linux/Mac)"""
+    """Nettoie la console"""
     os.system('cls' if os.name == 'nt' else 'clear')
 
-def print_title(title):
-    print("\n" + "="*60)
-    print(f" {title.center(58)}")
-    print("="*60 + "\n")
+def print_header(title, subtitle=None):
+    """Affiche un joli header"""
+    print("\n" + "═"*70)
+    print(f" {title.center(68)}")
+    if subtitle:
+        print(f" {subtitle.center(68)}")
+    print("═"*70 + "\n")
 
-def get_files(directory, extension):
-    """Récupère la liste des fichiers avec une extension donnée"""
+def print_info(msg):
+    print(f" [INFO] {msg}")
+
+def print_success(msg):
+    print(f" [OK]   {msg}")
+
+def print_warn(msg):
+    print(f" [!]    {msg}")
+
+def print_error(msg):
+    print(f" [X]    ERREUR: {msg}")
+
+def wait_enter():
+    input("\nAppuyez sur [Entrée] pour continuer...")
+
+def get_file_selection(directory, extension, description):
+    """Menu générique pour choisir un fichier"""
     if not os.path.exists(directory):
         os.makedirs(directory, exist_ok=True)
-        return []
-    return [f for f in os.listdir(directory) if f.endswith(extension)]
-
-def select_file_menu(directory, extension, prompt_text):
-    """Affiche un menu pour choisir un fichier"""
-    files = get_files(directory, extension)
-    if not files:
-        print(f"   [!] Aucun fichier '{extension}' trouvé dans {directory}.")
+        print_warn(f"Le dossier '{directory}' n'existait pas, je viens de le créer.")
         return None
-    
-    print(f"--- {prompt_text} ---")
+
+    files = glob.glob(os.path.join(directory, f"*{extension}"))
+    # Tri par date de modification (plus récent en premier)
+    files.sort(key=os.path.getmtime, reverse=True)
+
+    if not files:
+        print_warn(f"Aucun fichier '{extension}' trouvé dans '{directory}'.")
+        return None
+
+    print(f"--- Sélectionnez {description} ---")
     for i, f in enumerate(files):
-        print(f"   {i+1}. {f}")
+        filename = os.path.basename(f)
+        size = os.path.getsize(f) / (1024*1024)
+        print(f"   {i+1}. {filename:<30} ({size:.1f} MB)")
     
+    print("   0. Retour")
+
     while True:
-        choice = input("\n> Votre choix (numéro) : ")
         try:
+            choice = input("\n> Votre choix : ")
+            if choice == '0': return None
             idx = int(choice) - 1
             if 0 <= idx < len(files):
-                return os.path.join(directory, files[idx])
-            print("   [!] Numéro invalide.")
+                return files[idx]
         except ValueError:
-            print("   [!] Veuillez entrer un nombre.")
+            pass
+        print("   > Choix invalide.")
 
 # =============================================================================
-# FONCTIONS PRINCIPALES (ETAPES)
+# ETAPE 1 : EXTRACTION
 # =============================================================================
-
-def step_1_extraction():
-    print_title("ETAPE 1 : EXTRACTION DES SQUELETTES (Data Prep)")
-    print("Cette étape va :")
-    print("1. Lire une vidéo brute (.mp4)")
-    print("2. Détecter les squelettes frame par frame")
-    print("3. Créer un dataset (.pkl) prêt pour l'entraînement")
-    print("-" * 60)
-
-    video_path = select_file_menu("data/raw", ".mp4", "Choisissez la vidéo à traiter")
-    if not video_path: 
-        print("\n[CONSEIL] Placez vos fichiers .mp4 dans le dossier 'data/raw/'")
-        return
-
-    print(f"\n[SELECTION] Vous avez choisi : {os.path.basename(video_path)}")
-    mod_frame = input("> Garder 1 image sur X (défaut 5 pour qualité, 50 pour test rapide) : ") or "5"
-    try:
-        mod_frame = int(mod_frame)
-    except:
-        mod_frame = 5
-        print(f"   [!] Valeur invalide, utilisation de {mod_frame} par défaut")
+def step_extract():
+    print_header("ETAPE 1 : EXTRACTION", "Vidéo MP4 -> Dataset PKL")
     
-    print("\n" + "="*60)
-    print("[INFO] Démarrage de l'extraction...")
-    print("[INFO] Cela peut prendre plusieurs minutes selon la longueur de la vidéo")
-    print("="*60)
+    print("Cette étape transforme une vidéo en une liste de squelettes.")
+    print("Placez vos vidéos dans le dossier 'data/raw/'.\n")
+
+    video_path = get_file_selection("data/raw", ".mp4", "une vidéo source")
+    if not video_path: return
+
+    print("\n[CONFIGURATION]")
+    print("modFrame : Garder 1 image sur X.")
+    print("   * 1 = Qualité maximale (Lourd, extraction lente)")
+    print("   * 3 = Bon compromis (Recommandé)")
+    print("   * 10 = Rapide (Pour tester)")
+    
+    mod = input("> modFrame (défaut 3) : ") or "3"
     
     try:
-        start_time = time.time()
-        vs = VideoSkeleton(video_path, forceCompute=True, modFrame=mod_frame)
-        elapsed = time.time() - start_time
+        mod = int(mod)
+        print_header("EXTRACTION EN COURS...")
+        print_info(f"Traitement de : {os.path.basename(video_path)}")
+        print_info(f"Mode : 1 frame sur {mod}")
+        print_info("Cela peut prendre quelques minutes selon la durée de la vidéo...")
         
-        print("\n" + "="*60)
-        print("[✓ SUCCES] Extraction terminée!")
-        print(f"   - Squelettes extraits : {vs.skeCount()}")
-        print(f"   - Temps écoulé : {elapsed:.1f} secondes")
-        print(f"   - Dataset sauvegardé dans 'data/processed/'")
-        print("="*60)
-    except Exception as e:
-        print("\n" + "="*60)
-        print(f"[✗ ERREUR] L'extraction a échoué : {e}")
-        print("="*60)
-        print("\n[DIAGNOSTIC]")
-        import traceback
-        traceback.print_exc()
-
-def step_2_training():
-    print_title("ETAPE 2 : ENTRAÎNEMENT DU MODÈLE (Training)")
-    print("Cette étape va :")
-    print("1. Charger un dataset préparé (.pkl)")
-    print("2. Entraîner un réseau de neurones à générer le personnage")
-    print("-" * 60)
-
-    pkl_path = select_file_menu("data/processed", ".pkl", "Choisissez le dataset cible (Personnage)")
-    if not pkl_path: 
-        print("\n[CONSEIL] Faites d'abord l'étape 1 pour créer un dataset !")
-        return
-
-    print("\n--- Choix du Modèle ---")
-    print("   1. Vanilla NN (Vecteur -> Image) : Rapide, résultats corrects")
-    print("   2. Vanilla NN (Image -> Image)   : Plus lent, meilleurs détails")
-    print("   3. GAN (Generative Adversarial)  : Le plus long, meilleur réalisme")
-    
-    model_choice = input("\n> Votre choix (1-3) : ")
-    epochs = input("> Nombre d'epochs (défaut 50, recommandé: 100-200) : ") or "50"
-    try:
-        epochs = int(epochs)
-    except:
-        epochs = 50
-        print(f"   [!] Valeur invalide, utilisation de {epochs} epochs")
-
-    print("\n" + "="*60)
-    print(f"[INFO] Chargement du dataset: {os.path.basename(pkl_path)}")
-    print("="*60)
-    
-    try:
-        vs = VideoSkeleton(pkl_path, forceCompute=False)
-        if vs.skeCount() == 0:
-            print("\n[✗ ERREUR] Ce dataset est vide !")
-            print("[CONSEIL] Refaites l'étape 1 sur cette vidéo avec un modFrame plus faible")
-            return
-        print(f"[✓] Dataset chargé : {vs.skeCount()} squelettes disponibles")
-    except Exception as e:
-        print(f"\n[✗ ERREUR] Impossible de charger le dataset : {e}")
-        import traceback
-        traceback.print_exc()
-        return
-
-    print("\n" + "="*60)
-    print(f"[INFO] Démarrage de l'entraînement ({epochs} epochs)")
-    print("[INFO] Cela va prendre du temps... Soyez patient !")
-    print("="*60 + "\n")
-    
-    try:
         start_time = time.time()
         
-        if model_choice == '1':
-            print("[MODELE] Vanilla NN - Mode Vecteur vers Image")
+        # Lancement du calcul
+        vs = VideoSkeleton(video_path, forceCompute=True, modFrame=mod)
+        
+        duration = time.time() - start_time
+        
+        print_success(f"Terminé en {duration:.1f} secondes.")
+        print_success(f"Squelettes extraits : {vs.skeCount()}")
+        print_success(f"Fichier sauvegardé dans 'data/processed/'")
+        
+    except Exception as e:
+        print_error(str(e))
+        import traceback
+        traceback.print_exc()
+    
+    wait_enter()
+
+# =============================================================================
+# ETAPE 2 : ENTRAINEMENT
+# =============================================================================
+def step_train():
+    print_header("ETAPE 2 : ENTRAINEMENT", "Apprendre à générer le personnage")
+
+    pkl_path = get_file_selection("data/processed", ".pkl", "le dataset du personnage")
+    if not pkl_path: return
+
+    print("\n[CHOIX DU MODELE]")
+    print(" 1. Vanilla NN (Vecteur) : Rapide, mais résultats flous/abstraits.")
+    print(" 2. Vanilla NN (U-Net)   : Meilleur que le vecteur, traite les images.")
+    print(" 3. WGAN-GP (Pix2Pix)    : [RECOMMANDÉ] Le plus réaliste et net.")
+    
+    type_model = input("\n> Modèle (1-3) : ")
+    epochs = input("> Nombre d'epochs (défaut 200, recomm. 500+) : ") or "200"
+    
+    try:
+        n_epochs = int(epochs)
+        print_header("DÉMARRAGE DE L'ENTRAINEMENT")
+        print_info(f"Chargement du dataset : {os.path.basename(pkl_path)}")
+        
+        # Chargement dataset
+        vs = VideoSkeleton(pkl_path)
+        print_info(f"{vs.skeCount()} images disponibles pour l'entraînement.")
+
+        start_time = time.time()
+        gen = None
+
+        if type_model == '1':
+            print_info("Initialisation : Vanilla NN (Vector -> Image)")
             gen = GenVanillaNN(vs, loadFromFile=False, optSkeOrImage=1)
-            gen.train(n_epochs=epochs)
-        elif model_choice == '2':
-            print("[MODELE] Vanilla NN - Mode Image vers Image")
+        elif type_model == '2':
+            print_info("Initialisation : Vanilla NN (Image -> Image)")
             gen = GenVanillaNN(vs, loadFromFile=False, optSkeOrImage=2)
-            gen.train(n_epochs=epochs)
-        elif model_choice == '3':
-            print("[MODELE] GAN - Generative Adversarial Network")
+        elif type_model == '3':
+            print_info("Initialisation : WGAN-GP (Architecture GAN Stable)")
             gen = GenGAN(vs, loadFromFile=False)
-            gen.train(n_epochs=epochs)
         else:
-            print("\n[!] Choix invalide. Retour au menu.")
+            print_warn("Choix invalide.")
             return
+
+        print_info(f"Lancement pour {n_epochs} epochs. Patientez...")
         
-        elapsed = time.time() - start_time
-        print("\n" + "="*60)
-        print("[✓ SUCCES] Entraînement terminé!")
-        print(f"   - Temps total : {elapsed/60:.1f} minutes")
-        print(f"   - Modèle sauvegardé dans 'models/'")
-        print("="*60)
+        # Lancement Train
+        gen.train(n_epochs=n_epochs)
         
-    except TypeError as e:
-        # Gestion spécifique pour erreur verbose
-        if "verbose" in str(e):
-            print("\n" + "="*60)
-            print("[⚠ AVERTISSEMENT] Votre version de PyTorch est ancienne")
-            print("L'entraînement va continuer sans le mode verbose")
-            print("="*60)
-            print("\n[INFO] Redémarrage de l'entraînement...")
-            # On ne peut pas facilement redémarrer ici, l'erreur est déjà levée
-            # Le fix est maintenant dans GenVanillaNN.py
-        print("\n" + "="*60)
-        print(f"[✗ ERREUR] Problème de compatibilité : {e}")
-        print("="*60)
-        print("\n[DIAGNOSTIC]")
-        print(" - Assurez-vous que PyTorch est bien installé")
-        print(" - Essayez: pip install torch --upgrade")
-        import traceback
-        traceback.print_exc()
+        duration = (time.time() - start_time) / 60
+        print_success(f"Entraînement terminé en {duration:.1f} minutes.")
+        print_success("Le modèle a été sauvegardé dans le dossier 'models/'.")
         
     except Exception as e:
-        print("\n" + "="*60)
-        print(f"[✗ ERREUR] L'entraînement a planté : {e}")
-        print("="*60)
-        print("\n[DIAGNOSTIC]")
-        if "CUDA" in str(e) or "gpu" in str(e).lower():
-            print(" - Problème GPU détecté")
-            print(" - Le modèle utilisera le CPU à la place")
-        elif "memory" in str(e).lower() or "out of memory" in str(e).lower():
-            print(" - Mémoire insuffisante")
-            print(" - Réduisez le batch_size ou fermez d'autres programmes")
-        else:
-            print(" - Erreur inattendue, voir traceback ci-dessous")
-        print("-" * 60)
-        import traceback
-        traceback.print_exc()
-
-def step_3_demo():
-    print_title("ETAPE 3 : DÉMONSTRATION (Inference)")
-    print("Cette étape va :")
-    print("1. Prendre le mouvement d'une vidéo SOURCE")
-    print("2. L'appliquer sur le personnage CIBLE (appris à l'étape 2)")
-    print("-" * 60)
-
-    print("\n---> 1. LA SOURCE DU MOUVEMENT")
-    src_path = select_file_menu("data/raw", ".mp4", "Choisissez la vidéo Source (pour le mouvement)")
-    if not src_path: 
-        print("\n[CONSEIL] Placez une vidéo .mp4 dans 'data/raw/'")
-        return
-
-    print("\n---> 2. LE PERSONNAGE CIBLE")
-    tgt_path = select_file_menu("data/processed", ".pkl", "Choisissez le dataset Cible (personnage entraîné)")
-    if not tgt_path: 
-        print("\n[CONSEIL] Faites d'abord l'étape 1 et 2 sur une vidéo !")
-        return
-
-    print("\n---> 3. LE GÉNÉRATEUR")
-    print("   1. Nearest Neighbor (Pas d'IA, colle l'image la plus proche)")
-    print("   2. Vanilla NN (Vecteur -> Image)")
-    print("   3. Vanilla NN (Image -> Image)")
-    print("   4. GAN")
-    gen_choice = input("\n> Quel modèle utiliser ? (celui entraîné à l'étape 2) : ")
-    try:
-        gen_type = int(gen_choice)
-    except:
-        gen_type = 1
-        print(f"   [!] Valeur invalide, utilisation de Nearest Neighbor")
-
-    print("\n" + "="*60)
-    print("[INFO] Configuration de la démo :")
-    print(f"   - Mouvement source : {os.path.basename(src_path)}")
-    print(f"   - Personnage cible : {os.path.basename(tgt_path)}")
-    print(f"   - Générateur : Type {gen_type}")
-    print("="*60)
-    print("\n[DEMO] Lancement...")
-    print("       Appuyez sur 'q' dans la fenêtre vidéo pour quitter.")
-    print("-" * 60)
+        print_error(str(e))
     
+    wait_enter()
+
+# =============================================================================
+# ETAPE 3 : DEMO
+# =============================================================================
+def step_demo():
+    print_header("ETAPE 3 : GENERATION (DEMO)", "Transfert de mouvement")
+
+    print("1. Choisissez la vidéo qui donne le MOUVEMENT (Source)")
+    src_path = get_file_selection("data/raw", ".mp4", "Vidéo Source")
+    if not src_path: return
+
+    print("\n2. Choisissez le PERSONNAGE entraîné (Target)")
+    tgt_path = get_file_selection("data/processed", ".pkl", "Dataset Cible")
+    if not tgt_path: return
+
+    print("\n[TYPE DE GENERATEUR]")
+    print("Attention : Choisissez le même type que celui utilisé lors de l'entraînement !")
+    print(" 1. Nearest Neighbor (Pas d'IA, copie l'image la plus proche)")
+    print(" 2. Vanilla NN (Vecteur)")
+    print(" 3. Vanilla NN (U-Net)")
+    print(" 4. WGAN-GP (Si vous avez entraîné l'option 3)")
+    
+    gen_type = input("\n> Choix (1-4, défaut 4) : ") or "4"
+
     try:
-        dd = DanceDemo(src_path, gen_type, filename_tgt=tgt_path)
-        dd.draw(skip_frames=8, wait_ms=1)
-        print("\n[INFO] Démo terminée.")
+        print_header("LANCEMENT DE LA DEMO")
+        print_info("Chargement des modèles...")
+        print_info("Commandes : Appuyez sur 'q' pour quitter la fenêtre vidéo.")
+        
+        dd = DanceDemo(src_path, int(gen_type), filename_tgt=tgt_path)
+        dd.draw()
+        
+        print_success("Démo terminée correctement.")
+
     except Exception as e:
-        print("\n" + "="*60)
-        print(f"[✗ ERREUR] La démo a planté : {e}")
-        print("="*60)
-        print("\n[DIAGNOSTIC]")
-        print(" - Si 'index out of bounds' → le dataset cible est vide")
-        print(" - Si 'model not found' → il faut entraîner le modèle (étape 2)")
-        print(" - Si 'load_state_dict' → incompatibilité modèle sauvegardé")
-        print(" - Vérifiez que vous avez bien fait l'étape 1 ET 2 pour ce personnage")
-        print("-" * 60)
+        print_error(str(e))
         import traceback
         traceback.print_exc()
+        print("\n[ASTUCE] Si l'erreur est 'Size Mismatch' ou 'KeyError', vous n'utilisez pas le bon générateur pour ce modèle.")
+    
+    wait_enter()
 
 # =============================================================================
 # MENU PRINCIPAL
 # =============================================================================
-
 def main():
     while True:
-        print_title("PROJET DANCE GENERATION")
+        clear()
+        print_header("DEEP DANCE TRANSFER", "Projet Apprentissage & Image")
         print(" 1. [PREPARATION]   Extraire les squelettes d'une vidéo")
-        print(" 2. [APPRENTISSAGE] Entraîner un réseau de neurones")
-        print(" 3. [GENERATION]    Générer une vidéo de danse (Transfert)")
+        print(" 2. [APPRENTISSAGE] Entraîner le réseau de neurones")
+        print(" 3. [GENERATION]    Lancer la démo de transfert")
         print(" 4. Quitter")
         
-        choice = input("\n> Que voulez-vous faire ? ")
+        choice = input("\n> Votre choix : ")
         
         if choice == '1':
-            step_1_extraction()
+            step_extract()
         elif choice == '2':
-            step_2_training()
+            step_train()
         elif choice == '3':
-            step_3_demo()
+            step_demo()
         elif choice == '4':
-            print("\n" + "="*60)
-            print("Au revoir ! Bon développement 🚀")
-            print("="*60)
-            break
+            print("\nAu revoir !")
+            sys.exit(0)
         else:
-            print("\n[!] Option inconnue. Choisissez entre 1 et 4.")
-        
-        input("\n>>> Appuyez sur Entrée pour revenir au menu principal...")
-        clear()
+            print_warn("Option inconnue.")
+            time.sleep(1)
 
-if __name__ == '__main__':
-    # Vérification basique de la structure
-    if not os.path.exists("data/raw"):
-        os.makedirs("data/raw")
-        print("[Setup] Dossier 'data/raw' créé. Mettez vos vidéos dedans !")
-    if not os.path.exists("data/processed"):
-        os.makedirs("data/processed")
-    if not os.path.exists("models"):
-        os.makedirs("models")
-        print("[Setup] Dossier 'models' créé pour sauvegarder les modèles.")
+if __name__ == "__main__":
+    # Vérification des dossiers
+    for d in ["data/raw", "data/processed", "models"]:
+        if not os.path.exists(d):
+            os.makedirs(d)
+            print(f"[INIT] Dossier créé : {d}")
     
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n\n[INFO] Programme interrompu par l'utilisateur (Ctrl+C)")
-        print("Au revoir !")
-        sys.exit(0)
+    main()
