@@ -1,6 +1,5 @@
-import numpy as np
-import cv2
 import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 import sys
 import time
 import torch
@@ -11,6 +10,8 @@ from torchvision import transforms
 
 from VideoSkeleton import VideoSkeleton
 # On réutilise les outils du VanillaNN
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 from GenVanillaNN import GenNNSkeImToImage, VideoSkeletonDataset, SkeToImageTransform
 
 class Discriminator(nn.Module):
@@ -125,12 +126,12 @@ class GenGAN():
         optimizerG = optim.Adam(self.netG.parameters(), lr=lr, betas=(b1, b2))
         optimizerD = optim.Adam(self.netD.parameters(), lr=lr, betas=(b1, b2))
         
-        dataloader = DataLoader(self.dataset, batch_size=32, shuffle=True, num_workers=2)
+        dataloader = DataLoader(self.dataset, batch_size=512, shuffle=True, num_workers=12,pin_memory=True,persistent_workers=True)
         
         # --- STYLE VANILLA : Header ---
         print(f"[TRAIN] Début de l'entraînement sur {self.device}")
         print(f"[TRAIN] Dataset: {len(self.dataset)} paires (Squelette/Image)")
-        print(f"[TRAIN] Batch size: 32")
+        print(f"[TRAIN] Batch size: 512")
         print(f"[TRAIN] Nombre de batches: {len(dataloader)}")
         print(f"[TRAIN] Epochs demandés: {n_epochs}")
         print("[INFO] Appuyez sur Ctrl+C pour arrêter proprement.")
@@ -201,13 +202,13 @@ class GenGAN():
                 # --- Sauvegarde et Feedback ---
                 
                 # 1. Sauvegarde périodique (Standard)
-                if (epoch+1) % 5 == 0:
+                if (epoch+1) % 100 == 0:
                     torch.save(self.netG.state_dict(), self.filenameG)
                     torch.save(self.netD.state_dict(), self.filenameD)
                     print(f"  [✓] Checkpoint sauvegardé (Epoch {epoch+1})")
 
                 # 2. Sauvegarde historique (Archive)
-                if (epoch+1) % 50 == 0:
+                if (epoch+1) % 200 == 0:
                     name_G_hist = f"models/DanceGenGAN_G_epoch_{epoch+1}.pth"
                     name_D_hist = f"models/DanceGenGAN_D_epoch_{epoch+1}.pth"
                     torch.save(self.netG.state_dict(), name_G_hist)
