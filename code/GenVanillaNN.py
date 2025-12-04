@@ -103,6 +103,51 @@ def init_weights(m):
         nn.init.normal_(m.weight.data, 1.0, 0.02)
         nn.init.constant_(m.bias.data, 0)
 
+# ============================================================
+#                 SELF ATTENTION (image -> image)
+# ============================================================
+
+class SelfAttention(nn.Module):
+    def __init__(self, in_dim):
+        super().__init__()
+        self.query = nn.Conv2d(in_dim, in_dim // 8, 1)
+        self.key   = nn.Conv2d(in_dim, in_dim // 8, 1)
+        self.value = nn.Conv2d(in_dim, in_dim, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        B, C, H, W = x.size()
+
+        proj_query = self.query(x).view(B, -1, H*W).permute(0, 2, 1)
+        proj_key   = self.key(x).view(B, -1, H*W)
+        energy = torch.bmm(proj_query, proj_key)
+        attention = torch.softmax(energy, dim=-1)
+
+        proj_value = self.value(x).view(B, C, H*W)
+        out = torch.bmm(proj_value, attention.permute(0,2,1))
+        out = out.view(B, C, H, W)
+
+        return self.gamma * out + x
+
+
+# ============================================================
+#                 CHANNEL ATTENTION (Squeeze-Excite)
+# ============================================================
+
+class SEBlock(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // reduction, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        w = self.fc(x)
+        return x * w
 
 class GenNNSke26ToImage(nn.Module):
     def __init__(self):
@@ -154,6 +199,7 @@ class GenNNSkeImToImage(nn.Module):
     def __init__(self):
         super().__init__()
 
+        # ---------------- ENCODER ----------------
         self.enc1 = nn.Conv2d(3, 64, 4, 2, 1)
         self.enc1_bn = nn.BatchNorm2d(64)
 
@@ -166,6 +212,11 @@ class GenNNSkeImToImage(nn.Module):
         self.enc4 = nn.Conv2d(256, 512, 4, 2, 1)
         self.enc4_bn = nn.BatchNorm2d(512)
 
+        # -------- Self-Attention dans l’encodeur --------
+        self.att3 = SelfAttention(256)   # feature map 8×8
+        self.att4 = SelfAttention(512)   # feature map 4×4
+
+        # ---------------- DECODER ----------------
         self.dec1 = nn.ConvTranspose2d(512, 256, 4, 2, 1)
         self.dec1_bn = nn.BatchNorm2d(256)
 
@@ -180,22 +231,32 @@ class GenNNSkeImToImage(nn.Module):
 
         self.final = nn.Conv2d(32, 3, 3, 1, 1)
 
+        # -------- Squeeze-Excite dans le décodeur --------
+        self.se_d1 = SEBlock(256)
+        self.se_d2 = SEBlock(128)
+
         self.relu = nn.ReLU(inplace=True)
         self.lrelu = nn.LeakyReLU(0.2, inplace=True)
         self.tanh = nn.Tanh()
 
-        print("[GenNNSkeImToImage] Architecture U-Net AMELIOREE chargée")
+        print("[GenNNSkeImToImage] U-Net++ (SelfAttention + SEBlocks) chargé !")
 
     def forward(self, x):
-        e1 = self.lrelu(self.enc1_bn(self.enc1(x)))
-        e2 = self.lrelu(self.enc2_bn(self.enc2(e1)))
-        e3 = self.lrelu(self.enc3_bn(self.enc3(e2)))
-        e4 = self.lrelu(self.enc4_bn(self.enc4(e3)))
+        # -------- ENCODER --------
+        e1 = self.lrelu(self.enc1_bn(self.enc1(x)))  # 64×32×32
+        e2 = self.lrelu(self.enc2_bn(self.enc2(e1))) # 128×16×16
+        e3 = self.lrelu(self.enc3_bn(self.enc3(e2))) # 256×8×8
+        e3 = self.att3(e3)
+        e4 = self.lrelu(self.enc4_bn(self.enc4(e3))) # 512×4×4
+        e4 = self.att4(e4)
 
+        # -------- DECODER --------
         d1 = self.relu(self.dec1_bn(self.dec1(e4)))
+        d1 = self.se_d1(d1)
         d1 = torch.cat([d1, e3], dim=1)
 
         d2 = self.relu(self.dec2_bn(self.dec2(d1)))
+        d2 = self.se_d2(d2)
         d2 = torch.cat([d2, e2], dim=1)
 
         d3 = self.relu(self.dec3_bn(self.dec3(d2)))
@@ -205,6 +266,7 @@ class GenNNSkeImToImage(nn.Module):
 
         out = self.tanh(self.final(d4))
         return out
+
 
 
 class GenVanillaNN:
