@@ -44,27 +44,40 @@ def combineTwoImages(image1, image2):
         combined_image[:image2.shape[0], image1.shape[1]:] = image2
     return combined_image
 
+
 def crop_with_padding(image, x_start, y_start, width, height):
     img_height, img_width = image.shape[:2]
-    x_end = x_start + width
-    y_end = y_start + height
+
+    # Calcul des manques (padding nécessaire)
     pad_top = max(0, -y_start)
-    pad_bottom = max(0, y_end - img_height)
     pad_left = max(0, -x_start)
-    pad_right = max(0, x_end - img_width)
-    padded_image = np.pad(image, ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)), mode='constant', constant_values=0)
-    x_start = max(0, x_start)
-    y_start = max(0, y_start)
-    cropped_image = padded_image[y_start:y_start+height, x_start:x_start+width]
-    return cropped_image
+    pad_bottom = max(0, (y_start + height) - img_height)
+    pad_right = max(0, (x_start + width) - img_width)
+
+    # Si on est totalement hors champ (sécurité)
+    if pad_top >= height or pad_left >= width:
+        return np.zeros((height, width, 3), dtype=np.uint8)
+
+    # 1. On applique le padding (Remplissage intelligent 'edge' au lieu de noir)
+    if pad_top > 0 or pad_bottom > 0 or pad_left > 0 or pad_right > 0:
+        # mode='edge' répète le bord. mode='reflect' fait un miroir.
+        image = np.pad(image, ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)), mode='edge')
+
+    # 2. Maintenant que l'image est agrandie, on découpe la zone voulue
+    # Les coordonnées changent car on a ajouté des pixels en haut et à gauche
+    new_y = y_start + pad_top
+    new_x = x_start + pad_left
+
+    return image[new_y:new_y + height, new_x:new_x + width]
 
 class VideoSkeleton:
     """ 
     Class that associate a skeleton to each frame of a video
     """
-    def __init__(self, filename, forceCompute=False, modFrame=10, newVideoWidth=256, cropRatio=1.0, isCrop=True):
+    def __init__(self, filename, forceCompute=False, modFrame=10, newVideoWidth=128, cropRatio=1.3, isCrop=True):
         self.mod_frame = modFrame
-        
+        self.cropRatio = cropRatio  # <--- AJOUTER CETTE LIGNE
+        self.new_video_width = newVideoWidth  # <--- AJOUTER CETTE LIGNE
         # --- MODIF: Recherche automatique dans data/raw ---
         if not os.path.exists(filename):
             raw_path = os.path.join("data/raw", os.path.basename(filename))
@@ -115,7 +128,7 @@ class VideoSkeleton:
         widthIsSet = False
         frames_processed = 0
         frames_kept = 0
-        
+
         for i in range(total_frames):
             image = video.readFrame()
             if image is None: continue
@@ -161,25 +174,58 @@ class VideoSkeleton:
             self.new_video_width = newVideoWidth
             self.new_video_height = int(image.shape[0] * self.new_video_width / image.shape[1])
         self.ske_width_crop = int(cropRatio*self.new_video_width)
-        self.ske_height_crop = int(cropRatio*self.new_video_height)    
+        self.ske_height_crop = int(cropRatio*self.new_video_height)
 
     def cropAndSke(self, image, ske, isCrop=True):
-        image = cv2.resize(image, (self.new_video_width, self.new_video_height))
+        # 1. On garde l'image ORIGINALE (Haute qualité) pour les calculs
+        # On ne fait PAS de cv2.resize(image) ici !
+        img_height, img_width = image.shape[:2]
+
+        # Note : Pour que ske.fromImage marche, il faut s'assurer que le squelette
+        # a été détecté sur cette taille d'image, ou mis à l'échelle.
+        # (Supposons ici que ske correspond à l'image fournie en entrée)
+
         if ske.fromImage(image):
             if isCrop:
+                # On calcule la taille du crop basée sur un ratio de la hauteur originale
+                # Ex: Si la vidéo fait 1080p, crop_size sera ~1000px
+                dim_ref = min(img_width, img_height)
+                crop_size = int(dim_ref * self.cropRatio)  # Il faut que cropRatio soit dispo ici
+
                 xm, ym, xM, yM = ske.boundingBox()
-                center_x = self.new_video_width * (xm + xM) / 2
-                center_y = self.new_video_height * (ym + yM) / 2
-                xm = int(center_x-self.ske_width_crop/2)
-                xM = int(center_x+self.ske_width_crop/2)
-                ym = int(center_y-self.ske_height_crop/2)
-                yM = int(center_y+self.ske_height_crop/2)
-                image = crop_with_padding(image, xm, ym, self.ske_width_crop, self.ske_height_crop)
-                ske.crop(xm/self.new_video_width, ym/self.new_video_height, 
-                         self.ske_width_crop/self.new_video_width, self.ske_height_crop/self.new_video_height)
-            return True, image, ske
-        else:
-            return False, image, ske        
+                center_x = (xm + xM) * img_width / 2
+                center_y = (ym + yM) * img_height / 2
+
+                tl_x = int(center_x - crop_size / 2)
+                tl_y = int(center_y - crop_size / 2)
+
+                # Clamping (éviter de sortir de l'image)
+                tl_x = max(0, min(tl_x, img_width - crop_size))
+                tl_y = max(0, min(tl_y, img_height - crop_size))
+
+                # Découpe Haute Résolution
+                image_crop = image[tl_y: tl_y + crop_size, tl_x: tl_x + crop_size]
+
+                # --- C'EST ICI QU'ON UTILISE newVideoWidth ---
+                # On redimensionne le CROP final vers la taille voulue (ex: 128x128)
+                # On force un carré.
+                image_final = cv2.resize(image_crop, (self.new_video_width, self.new_video_width))
+
+                # Mise à jour du squelette (Normalisation classique)
+                real_h, real_w = image_crop.shape[:2]
+                norm_x = tl_x / img_width
+                norm_y = tl_y / img_height
+                norm_w = real_w / img_width
+                norm_h = real_h / img_height
+                ske.crop(norm_x, norm_y, norm_w, norm_h)
+
+                return True, image_final, ske
+
+            # Si pas de crop, on resize tout brutalement en carré
+            image_final = cv2.resize(image, (self.new_video_width, self.new_video_width))
+            return True, image_final, ske
+
+        return False, image, ske
 
     def save(self, filename):
         with open(filename, "wb") as fichier:
@@ -215,6 +261,50 @@ class VideoSkeleton:
 
 if __name__ == '__main__':
     # Test rapide
-    filename = "data/raw/taichi1.mp4"
-    s = VideoSkeleton(filename, forceCompute=True, modFrame=50)
-    s.draw()
+    # filename = "../data/raw/taichi1.mp4"
+    # s = VideoSkeleton(filename, forceCompute=True, modFrame=1000, newVideoWidth=256, cropRatio=2.0)
+    # image_noire = np.zeros((s.ske_height_crop, s.ske_width_crop, 3), dtype=np.uint8)
+    # s.ske[2].draw(image_noire)
+
+    # 1. Configuration
+    filename = "../data/raw/taichi1.mp4"
+
+    print("-" * 30)
+    print("DEMARRAGE DU TEST VISUEL")
+
+    # 2. Chargement (forceCompute=False pour utiliser ce qui est déjà calculé)
+    # Assure-toi que cropRatio est bien à 2.0 ici
+    s = VideoSkeleton(filename, forceCompute=False, newVideoWidth=256, cropRatio=2.0)
+
+    # 3. Vérification du nombre de squelettes
+    count = s.skeCount()
+    print(f"Nombre de squelettes trouvés : {count}")
+
+    if count > 0:
+        # On prend le premier squelette (index 0) pour être sûr qu'il existe
+        idx = 0
+
+        # Création image noire (H, W, 3)
+        print(f"Dimensions de l'image (H, W) : {s.ske_height_crop} x {s.ske_width_crop}")
+        image_noire = np.zeros((s.ske_height_crop, s.ske_width_crop, 3), dtype=np.uint8)
+
+        # Dessin
+        print(f"Dessin du squelette n°{idx}...")
+        try:
+            s.ske[idx].draw(image_noire)
+
+            # 4. AFFICHAGE (Le point critique)
+            cv2.imshow('Verification Squelette', image_noire)
+
+            print(">>> FENETRE OUVERTE. Appuie sur une touche du clavier pour quitter. <<<")
+            # waitKey(0) BLOQUE le programme indéfiniment jusqu'à une touche
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+
+        except Exception as e:
+            print(f"Erreur pendant le dessin : {e}")
+            print("Vérifie que tu as bien corrigé la classe VideoSkeleton (numpy object) !")
+    else:
+        print("ERREUR : Aucun squelette dans la liste.")
+        print("1. Vérifie le chemin de la vidéo.")
+        print("2. Essaie de mettre forceCompute=True pour recalculer.")

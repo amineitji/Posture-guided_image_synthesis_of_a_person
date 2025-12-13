@@ -20,9 +20,21 @@ from VideoSkeleton import VideoSkeleton
 from VideoReader import VideoReader
 from Skeleton import Skeleton
 
+# =============================================================================
+# OPTIMISATIONS RTX 4060 (Ada Lovelace)
+# =============================================================================
 torch.set_default_dtype(torch.float32)
 
+# 1. Active le TensorFloat-32 (TF32) : Indispensable sur RTX 4000
+# 'high' = très rapide, perte précision minime. 'medium' = encore plus rapide.
+torch.set_float32_matmul_precision('high')
+
+# 2. Benchmark CuDNN pour trouver l'algo de convolution le plus rapide
+torch.backends.cudnn.benchmark = True
+
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+
 class SkeToImageTransform:
     def __init__(self, image_size):
         self.imsize = image_size
@@ -47,30 +59,45 @@ class VideoSkeletonDataset(Dataset):
         self.source_transform = source_transform
         self.target_transform = target_transform
         self.ske_reduced = ske_reduced
-        print(
-            "VideoSkeletonDataset: ",
-            "ske_reduced=",
-            ske_reduced,
-            "=(",
-            Skeleton.reduced_dim,
-            " or ",
-            Skeleton.full_dim,
-            ")",
-        )
+
+        print(f"[DATASET] Chargement des données en RAM pour accélérer l'entraînement...")
+        self.cached_images = []
+        self.cached_skeletons = []
+
+        # --- PRÉ-CHARGEMENT EN RAM ---
+        # On lit TOUTES les images maintenant. Ça prendra quelques secondes au début,
+        # mais ensuite l'entraînement sera ultra-fluide.
+        for idx in range(self.videoSke.skeCount()):
+            # 1. Charger l'image
+            # On convertit tout de suite en RGB pour éviter de le refaire 1000 fois
+            img = Image.open(self.videoSke.imagePath(idx)).convert('RGB')
+            self.cached_images.append(img)
+
+            # 2. Préparer le squelette
+            # On fait le calcul numpy -> torch tout de suite aussi
+            ske = self.videoSke.ske[idx]
+            ske_tensor = self.preprocessSkeleton(ske)
+            self.cached_skeletons.append(ske_tensor)
+
+        print(f"[DATASET] {len(self.cached_images)} images chargées en mémoire RAM. Prêt !")
 
     def __len__(self):
-        return self.videoSke.skeCount()
+        return len(self.cached_images)
 
     def __getitem__(self, idx):
-        ske = self.videoSke.ske[idx]
-        ske = self.preprocessSkeleton(ske)
+        # ACCÈS INSTANTANÉ (Plus de lecture disque)
+        image = self.cached_images[idx]
+        ske = self.cached_skeletons[idx]
 
-        image = Image.open(self.videoSke.imagePath(idx))
+        # On applique les transformations (Data Augmentation) à la volée
+        # C'est important de le faire ici pour que le "Random" fonctionne à chaque epoch
         if self.target_transform:
             image = self.target_transform(image)
+
         return ske, image
 
     def preprocessSkeleton(self, ske):
+        # Cette fonction ne change pas, elle est juste appelée dans le __init__ maintenant
         if self.source_transform:
             ske = self.source_transform(ske)
         else:
@@ -89,103 +116,49 @@ class VideoSkeletonDataset(Dataset):
         return ske
 
     def tensor2image(self, normalized_image):
-        numpy_image = normalized_image.detach().cpu().numpy()
+        numpy_image = normalized_image.detach().cpu().float().numpy()
         numpy_image = np.transpose(numpy_image, (1, 2, 0))
         numpy_image = (numpy_image * 0.5 + 0.5) * 255
-        return numpy_image.astype(np.uint8)
+        return numpy_image.clip(0, 255).astype(np.uint8)
 
-
-def init_weights(m):
-    classname = m.__class__.__name__
-    if classname.find("Conv") != -1:
-        nn.init.normal_(m.weight.data, 0.0, 0.02)
-    elif classname.find("BatchNorm") != -1:
-        nn.init.normal_(m.weight.data, 1.0, 0.02)
-        nn.init.constant_(m.bias.data, 0)
-
-# ============================================================
-#                 SELF ATTENTION (image -> image)
-# ============================================================
 
 class SelfAttention(nn.Module):
     def __init__(self, in_dim):
         super().__init__()
         self.query = nn.Conv2d(in_dim, in_dim // 8, 1)
-        self.key   = nn.Conv2d(in_dim, in_dim // 8, 1)
+        self.key = nn.Conv2d(in_dim, in_dim // 8, 1)
         self.value = nn.Conv2d(in_dim, in_dim, 1)
         self.gamma = nn.Parameter(torch.zeros(1))
 
     def forward(self, x):
         B, C, H, W = x.size()
-
-        proj_query = self.query(x).view(B, -1, H*W).permute(0, 2, 1)
-        proj_key   = self.key(x).view(B, -1, H*W)
+        proj_query = self.query(x).view(B, -1, H * W).permute(0, 2, 1)
+        proj_key = self.key(x).view(B, -1, H * W)
         energy = torch.bmm(proj_query, proj_key)
         attention = torch.softmax(energy, dim=-1)
-
-        proj_value = self.value(x).view(B, C, H*W)
-        out = torch.bmm(proj_value, attention.permute(0,2,1))
+        proj_value = self.value(x).view(B, C, H * W)
+        out = torch.bmm(proj_value, attention.permute(0, 2, 1))
         out = out.view(B, C, H, W)
-
         return self.gamma * out + x
 
-
-# ============================================================
-#                 CHANNEL ATTENTION (Squeeze-Excite)
-# ============================================================
-
-class SEBlock(nn.Module):
-    def __init__(self, channels, reduction=16):
-        super().__init__()
-        self.fc = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, channels // reduction, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels // reduction, channels, 1),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        w = self.fc(x)
-        return x * w
 
 class GenNNSke26ToImage(nn.Module):
     def __init__(self):
         super().__init__()
         self.input_dim = Skeleton.reduced_dim
-
         self.fc = nn.Sequential(
-            nn.Linear(26, 256),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(256, 512),
-            nn.BatchNorm1d(512),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(512, 1024),
-            nn.BatchNorm1d(1024),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(1024, 512 * 4 * 4),
-            nn.BatchNorm1d(512 * 4 * 4),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(26, 256), nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(256, 512), nn.BatchNorm1d(512), nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(512, 1024), nn.BatchNorm1d(1024), nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(1024, 512 * 4 * 4), nn.BatchNorm1d(512 * 4 * 4), nn.LeakyReLU(0.2, inplace=True),
         )
-
         self.conv = nn.Sequential(
-            nn.ConvTranspose2d(512, 256, 4, 2, 1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(256, 128, 4, 2, 1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(128, 64, 4, 2, 1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(64, 32, 4, 2, 1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 3, 3, 1, 1),
-            nn.Tanh(),
+            nn.ConvTranspose2d(512, 256, 4, 2, 1), nn.BatchNorm2d(256), nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(256, 128, 4, 2, 1), nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(128, 64, 4, 2, 1), nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(64, 32, 4, 2, 1), nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+            nn.Conv2d(32, 3, 3, 1, 1), nn.Tanh(),
         )
-
-        print("[GenNNSke26ToImage] Architecture AMELIOREE chargée")
 
     def forward(self, z):
         z = z.view(z.size(0), -1)
@@ -195,88 +168,141 @@ class GenNNSke26ToImage(nn.Module):
         return img
 
 
+class ResidualBlock(nn.Module):
+    """
+    Un bloc qui permet au réseau d'apprendre plus de détails
+    sans perdre l'information originale.
+    """
+
+    def __init__(self, in_channels):
+        super(ResidualBlock, self).__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(in_channels)
+        )
+
+    def forward(self, x):
+        return x + self.block(x)  # On ajoute l'entrée à la sortie (Skip Connection locale)
+
+
 class GenNNSkeImToImage(nn.Module):
     def __init__(self):
         super().__init__()
 
-        # ---------------- ENCODER ----------------
-        self.enc1 = nn.Conv2d(3, 64, 4, 2, 1)
-        self.enc1_bn = nn.BatchNorm2d(64)
+        # --- ENCODER ---
+        # On garde la structure 32 -> 64 -> 128 -> 256 pour la vitesse
 
-        self.enc2 = nn.Conv2d(64, 128, 4, 2, 1)
-        self.enc2_bn = nn.BatchNorm2d(128)
+        # E1: 3 -> 32
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(3, 32, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(32), nn.LeakyReLU(0.2, inplace=True),
+            ResidualBlock(32),  # Ajout de "mémoire"
+            nn.Conv2d(32, 32, 4, 2, 1, bias=False),  # Downsample
+            nn.BatchNorm2d(32), nn.LeakyReLU(0.2, inplace=True)
+        )
 
-        self.enc3 = nn.Conv2d(128, 256, 4, 2, 1)
-        self.enc3_bn = nn.BatchNorm2d(256)
+        # E2: 32 -> 64
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(32, 64, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(64), nn.LeakyReLU(0.2, inplace=True),
+            ResidualBlock(64),
+            nn.Conv2d(64, 64, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(64), nn.LeakyReLU(0.2, inplace=True)
+        )
 
-        self.enc4 = nn.Conv2d(256, 512, 4, 2, 1)
-        self.enc4_bn = nn.BatchNorm2d(512)
+        # E3: 64 -> 128
+        self.enc3 = nn.Sequential(
+            nn.Conv2d(64, 128, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(128), nn.LeakyReLU(0.2, inplace=True),
+            ResidualBlock(128),
+            nn.Conv2d(128, 128, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(128), nn.LeakyReLU(0.2, inplace=True)
+        )
 
-        # -------- Self-Attention dans l’encodeur --------
-        self.att3 = SelfAttention(256)   # feature map 8×8
-        self.att4 = SelfAttention(512)   # feature map 4×4
+        # E4 (Bottleneck): 128 -> 256
+        self.enc4 = nn.Sequential(
+            nn.Conv2d(128, 256, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(256), nn.LeakyReLU(0.2, inplace=True),
+            ResidualBlock(256),
+            ResidualBlock(256),  # Double dose pour le bottleneck
+            nn.Conv2d(256, 256, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(256), nn.LeakyReLU(0.2, inplace=True)
+        )
 
-        # ---------------- DECODER ----------------
-        self.dec1 = nn.ConvTranspose2d(512, 256, 4, 2, 1)
-        self.dec1_bn = nn.BatchNorm2d(256)
+        # --- DECODER (Amélioré : Upsample + Conv) ---
 
-        self.dec2 = nn.ConvTranspose2d(256 + 256, 128, 4, 2, 1)
-        self.dec2_bn = nn.BatchNorm2d(128)
+        # D1: 256 -> 128
+        self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(256, 128, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            ResidualBlock(128)
+        )
 
-        self.dec3 = nn.ConvTranspose2d(128 + 128, 64, 4, 2, 1)
-        self.dec3_bn = nn.BatchNorm2d(64)
+        # D2: 256 (128+128 cat) -> 64
+        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.dec2 = nn.Sequential(
+            nn.Conv2d(256, 64, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            ResidualBlock(64)
+        )
 
-        self.dec4 = nn.ConvTranspose2d(64 + 64, 32, 4, 2, 1)
-        self.dec4_bn = nn.BatchNorm2d(32)
+        # D3: 128 (64+64 cat) -> 32
+        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.dec3 = nn.Sequential(
+            nn.Conv2d(128, 32, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+            ResidualBlock(32)
+        )
 
-        self.final = nn.Conv2d(32, 3, 3, 1, 1)
-
-        # -------- Squeeze-Excite dans le décodeur --------
-        self.se_d1 = SEBlock(256)
-        self.se_d2 = SEBlock(128)
-
-        self.relu = nn.ReLU(inplace=True)
-        self.lrelu = nn.LeakyReLU(0.2, inplace=True)
-        self.tanh = nn.Tanh()
-
-        print("[GenNNSkeImToImage] U-Net++ (SelfAttention + SEBlocks) chargé !")
+        # D4: 64 (32+32 cat) -> 3
+        self.up4 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.dec4 = nn.Sequential(
+            nn.Conv2d(64, 32, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+            nn.Conv2d(32, 3, 3, 1, 1),  # Sortie finale
+            nn.Tanh()
+        )
 
     def forward(self, x):
-        # -------- ENCODER --------
-        e1 = self.lrelu(self.enc1_bn(self.enc1(x)))  # 64×32×32
-        e2 = self.lrelu(self.enc2_bn(self.enc2(e1))) # 128×16×16
-        e3 = self.lrelu(self.enc3_bn(self.enc3(e2))) # 256×8×8
-        e3 = self.att3(e3)
-        e4 = self.lrelu(self.enc4_bn(self.enc4(e3))) # 512×4×4
-        e4 = self.att4(e4)
+        # Encoder
+        e1 = self.enc1(x)
+        e2 = self.enc2(e1)
+        e3 = self.enc3(e2)
+        e4 = self.enc4(e3)
 
-        # -------- DECODER --------
-        d1 = self.relu(self.dec1_bn(self.dec1(e4)))
-        d1 = self.se_d1(d1)
-        d1 = torch.cat([d1, e3], dim=1)
+        # Decoder
+        # D1
+        d1 = self.up1(e4)  # On agrandit d'abord
+        d1 = self.dec1(d1)  # Puis on traite
+        d1_cat = torch.cat([d1, e3], dim=1)
 
-        d2 = self.relu(self.dec2_bn(self.dec2(d1)))
-        d2 = self.se_d2(d2)
-        d2 = torch.cat([d2, e2], dim=1)
+        # D2
+        d2 = self.up2(d1_cat)
+        d2 = self.dec2(d2)
+        d2_cat = torch.cat([d2, e2], dim=1)
 
-        d3 = self.relu(self.dec3_bn(self.dec3(d2)))
-        d3 = torch.cat([d3, e1], dim=1)
+        # D3
+        d3 = self.up3(d2_cat)
+        d3 = self.dec3(d3)
+        d3_cat = torch.cat([d3, e1], dim=1)
 
-        d4 = self.relu(self.dec4_bn(self.dec4(d3)))
+        # D4
+        d4 = self.up4(d3_cat)
+        output = self.dec4(d4)
 
-        out = self.tanh(self.final(d4))
-        return out
-
+        return output
 
 
 class GenVanillaNN:
     def __init__(self, videoSke, loadFromFile=False, optSkeOrImage=1):
-        image_size = 64
+        # 128x128 est un bon compromis pour 8GB VRAM. 256x256 peut passer avec batch=8.
+        image_size = 128
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         print(f"[GPU] Device: {self.device}")
-        if torch.cuda.is_available():
-            print(f"[GPU] Name: {torch.cuda.get_device_name(0)}")
-            print(f"[GPU] Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
 
         self.optSkeOrImage = optSkeOrImage
 
@@ -285,206 +311,43 @@ class GenVanillaNN:
             src_transform = None
             self.filename = "models/DanceGenVanillaFromSke26.pth"
         else:
-            self.netG = GenNNSkeImToImage().to(self.device)
-            src_transform = transforms.Compose(
-                [
-                    SkeToImageTransform(image_size),
-                    transforms.ToTensor(),
-                    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-                ]
-            )
-            self.filename = "models/DanceGenVanillaFromSkeim.pth"
+            self.netG = GenNNSkeImToImage()
+            # 3. OPTIMISATION : Channels Last Memory Format
+            # Les RTX 4000 sont beaucoup plus rapides si la mémoire est agencée en (N, H, W, C)
+            self.netG = self.netG.to(memory_format=torch.channels_last)
+            self.netG = self.netG.to(self.device)
 
-        tgt_transform = transforms.Compose(
-            [
-                transforms.Resize(image_size),
-                transforms.CenterCrop(image_size),
-                transforms.RandomHorizontalFlip(p=0.3),
-                transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1),
-                transforms.RandomRotation(5),
+            src_transform = transforms.Compose([
+                SkeToImageTransform(image_size),
                 transforms.ToTensor(),
                 transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-            ]
-        )
+            ])
+            self.filename = "models/DanceGenVanillaFromSkeim.pth"
+
+        tgt_transform = transforms.Compose([
+            # Si VideoSkeleton sort déjà du 128x128, ceci est juste une sécurité
+            transforms.Resize((image_size, image_size)),
+
+            # On garde le Jitter car il aide l'IA à gérer l'éclairage sans casser la pose
+            transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1),
+
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
 
         self.dataset = VideoSkeletonDataset(
             videoSke, ske_reduced=True, target_transform=tgt_transform, source_transform=src_transform
-        )
-
-        # Dataloader “général” (peu utilisé dans ton train(), mais on le met propre)
-        base_workers = 12 if torch.cuda.is_available() else 2
-        self.dataloader = DataLoader(
-            dataset=self.dataset,
-            batch_size=512,
-            shuffle=True,
-            num_workers=base_workers,
-            pin_memory=True,
-            persistent_workers=True,
         )
 
         if loadFromFile and os.path.isfile(self.filename):
             print("GenVanillaNN: Load=", self.filename)
             try:
                 state_dict = torch.load(self.filename, map_location=self.device)
-
-                if any(key.startswith("_orig_mod.") for key in state_dict.keys()):
-                    new_state_dict = {}
-                    for key, value in state_dict.items():
-                        new_key = key.replace("_orig_mod.", "")
-                        new_state_dict[new_key] = value
-                    state_dict = new_state_dict
-
-                self.netG.load_state_dict(state_dict)
+                new_state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+                self.netG.load_state_dict(new_state_dict)
                 print("[✓] Modèle chargé avec succès")
             except Exception as e:
                 print(f"[✗] Erreur chargement: {e}")
-                print("[!] Le modèle sera réentraîné")
-
-        print(f"[GenVanillaNN] Mode: {'Vecteur->Image' if optSkeOrImage == 1 else 'Image->Image'}")
-        print(f"[GenVanillaNN] Data Augmentation activée!")
-
-    def train(self, n_epochs=20):
-        print(f"[TRAIN] Début de l'entraînement sur {self.device}")
-        print(f"[TRAIN] Dataset: {len(self.dataset)} frames")
-
-        train_size = int(0.85 * len(self.dataset))
-        val_size = len(self.dataset) - train_size
-        train_dataset, val_dataset = torch.utils.data.random_split(self.dataset, [train_size, val_size])
-
-        batch_size = 512
-        print(f"[TRAIN] Train: {train_size} | Val: {val_size}")
-        print(f"[TRAIN] Batch size: {batch_size}")
-
-        num_workers = 12 if torch.cuda.is_available() else 2
-
-        train_loader = DataLoader(
-            dataset=train_dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=True,
-        )
-        val_loader = DataLoader(
-            dataset=val_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=True,
-        )
-
-        print(f"[TRAIN] Nombre de batches train: {len(train_loader)}")
-        print(f"[TRAIN] Workers: {num_workers} threads")
-        print(f"[TRAIN] Epochs demandés: {n_epochs}")
-        print("-" * 60)
-
-        criterion_mse = nn.MSELoss()
-        criterion_l1 = nn.L1Loss()
-
-        optimizer = optim.Adam(self.netG.parameters(), lr=0.0002, betas=(0.5, 0.999))
-
-        try:
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode="min", factor=0.5, patience=5, verbose=True
-            )
-        except TypeError:
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode="min", factor=0.5, patience=5
-            )
-
-        use_amp = torch.cuda.is_available()
-        scaler = torch.cuda.amp.GradScaler() if use_amp else None
-        if use_amp:
-            print("[OPTIM] Mixed Precision (AMP) activée")
-
-        best_val_loss = float("inf")
-
-        for epoch in range(n_epochs):
-            self.netG.train()
-            running_loss = 0.0
-            batch_count = 0
-
-            for i, (inputs, targets) in enumerate(train_loader):
-                inputs = inputs.to(self.device, non_blocking=True)
-                targets = targets.to(self.device, non_blocking=True)
-
-                optimizer.zero_grad()
-
-                if use_amp:
-                    with torch.amp.autocast("cuda"):
-                        outputs = self.netG(inputs)
-                        loss_mse = criterion_mse(outputs, targets)
-                        loss_l1 = criterion_l1(outputs, targets)
-                        loss = 0.6 * loss_mse + 0.4 * loss_l1
-
-                    scaler.scale(loss).backward()
-                    torch.nn.utils.clip_grad_norm_(self.netG.parameters(), max_norm=1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    outputs = self.netG(inputs)
-                    loss_mse = criterion_mse(outputs, targets)
-                    loss_l1 = criterion_l1(outputs, targets)
-                    loss = 0.6 * loss_mse + 0.4 * loss_l1
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.netG.parameters(), max_norm=1.0)
-                    optimizer.step()
-
-                running_loss += loss.item()
-                batch_count += 1
-
-                if (i + 1) % 10 == 0:
-                    print(
-                        f"  [Epoch {epoch+1}/{n_epochs}] "
-                        f"Batch {i+1}/{len(train_loader)} - Loss: {loss.item():.5f}"
-                    )
-
-            avg_train_loss = running_loss / batch_count
-
-            # ---------- Validation ----------
-            self.netG.eval()
-            val_loss = 0.0
-            val_count = 0
-
-            with torch.no_grad():
-                for inputs, targets in val_loader:
-                    inputs = inputs.to(self.device, non_blocking=True)
-                    targets = targets.to(self.device, non_blocking=True)
-
-                    if use_amp:
-                        with torch.amp.autocast("cuda"):
-                            outputs = self.netG(inputs)
-                            loss_mse = criterion_mse(outputs, targets)
-                            loss_l1 = criterion_l1(outputs, targets)
-                            loss = 0.6 * loss_mse + 0.4 * loss_l1
-                    else:
-                        outputs = self.netG(inputs)
-                        loss_mse = criterion_mse(outputs, targets)
-                        loss_l1 = criterion_l1(outputs, targets)
-                        loss = 0.6 * loss_mse + 0.4 * loss_l1
-
-                    val_loss += loss.item()
-                    val_count += 1
-
-            avg_val_loss = val_loss / val_count
-
-            scheduler.step(avg_val_loss)
-
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
-                torch.save(self.netG.state_dict(), self.filename)
-                print(f"  [✓] Meilleur modèle sauvegardé (val_loss: {avg_val_loss:.5f})")
-
-            print(
-                f"[EPOCH {epoch+1}/{n_epochs} TERMINÉ] "
-                f"Train Loss: {avg_train_loss:.5f} | Val Loss: {avg_val_loss:.5f}"
-            )
-            print("-" * 60)
-
-        print("[TRAIN] Entraînement terminé avec succès!")
-        print(f"[TRAIN] Meilleur Val Loss: {best_val_loss:.5f}")
-        print(f"[TRAIN] Modèle sauvegardé dans {self.filename}")
 
     def generate(self, ske):
         self.netG.eval()
@@ -493,44 +356,193 @@ class GenVanillaNN:
                 ske_input = torch.from_numpy(ske.toarray(reduced=True).flatten()).float()
                 ske_input = ske_input.unsqueeze(0).to(self.device)
             else:
-                transform = transforms.Compose(
-                    [
-                        SkeToImageTransform(64),
-                        transforms.ToTensor(),
-                        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-                    ]
-                )
-                ske_input = transform(ske).unsqueeze(0).to(self.device)
+                transform = transforms.Compose([
+                    SkeToImageTransform(256),
+                    transforms.ToTensor(),
+                    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+                ])
+                ske_input = transform(ske).unsqueeze(0).to(self.device, memory_format=torch.channels_last)
 
-            output = self.netG(ske_input)
-            res = self.dataset.tensor2image(output[0])
-            return res
+            with torch.amp.autocast("cuda"):
+                output = self.netG(ske_input)
+
+            # Récupération en RGB (Sortie standard PyTorch)
+            rgb_image = self.dataset.tensor2image(output[0])
+
+            # --- CORRECTION ICI : Conversion RGB vers BGR ---
+            bgr_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
+            # ------------------------------------------------
+
+            return bgr_image
+    def train(self, n_epochs=20):
+        print(f"[TRAIN] Début de l'entraînement sur {self.device}")
+
+        batch_size = 256
+
+        train_size = int(0.85 * len(self.dataset))
+        val_size = len(self.dataset) - train_size
+        train_dataset, val_dataset = torch.utils.data.random_split(self.dataset, [train_size, val_size])
+
+        num_workers = 0
+
+        train_loader = DataLoader(
+            dataset=train_dataset, batch_size=batch_size, shuffle=True,
+            num_workers=num_workers, pin_memory=True
+        )
+        val_loader = DataLoader(
+            dataset=val_dataset, batch_size=batch_size, shuffle=False,
+            num_workers=num_workers, pin_memory=True
+        )
+
+        # --- VISU: On récupère un squelette fixe UNE SEULE FOIS avant la boucle ---
+        fixed_sample_iter = iter(val_loader)
+        fixed_sample = next(fixed_sample_iter)
+        fixed_ske = fixed_sample[0][0:1].to(self.device, non_blocking=True, memory_format=torch.channels_last)
+        print("[TRAIN] Image témoin chargée pour la visualisation")
+
+        # Création du dossier de suivi s'il n'existe pas
+        if not os.path.exists("images_suivi"):
+            os.makedirs("images_suivi")
+        # ---------------------------------------------------------
+
+        criterion_mse = nn.MSELoss()
+        criterion_l1 = nn.L1Loss()
+        optimizer = optim.Adam(self.netG.parameters(), lr=0.0002, betas=(0.5, 0.999))
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
+
+        scaler = torch.cuda.amp.GradScaler()
+
+        best_val_loss = float("inf")
+
+        # J'AI SUPPRIMÉ LES LIGNES cv2.namedWindow ICI !
+
+        for epoch in range(n_epochs):
+            self.netG.train()
+            running_loss = 0.0
+            batch_count = 0
+
+            for i, (inputs, targets) in enumerate(train_loader):
+                inputs = inputs.to(self.device, non_blocking=True, memory_format=torch.channels_last)
+                targets = targets.to(self.device, non_blocking=True, memory_format=torch.channels_last)
+
+                optimizer.zero_grad(set_to_none=True)
+
+                with torch.amp.autocast("cuda"):
+                    outputs = self.netG(inputs)
+                    loss_mse = criterion_mse(outputs, targets)
+                    loss_l1 = criterion_l1(outputs, targets)
+                    loss = 0.6 * loss_mse + 0.4 * loss_l1
+
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
+                running_loss += loss.item()
+                batch_count += 1
+
+                if i % 10 == 0:
+                    print(f"\rEpoch {epoch + 1} [{i}/{len(train_loader)}] Loss: {loss.item():.4f}", end="")
+
+            avg_train_loss = running_loss / batch_count
+
+            # Validation
+            self.netG.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for inputs, targets in val_loader:
+                    inputs = inputs.to(self.device, non_blocking=True, memory_format=torch.channels_last)
+                    targets = targets.to(self.device, non_blocking=True, memory_format=torch.channels_last)
+
+                    with torch.amp.autocast("cuda"):
+                        outputs = self.netG(inputs)
+                        loss = 0.6 * criterion_mse(outputs, targets) + 0.4 * criterion_l1(outputs, targets)
+                    val_loss += loss.item()
+
+            avg_val_loss = val_loss / len(val_loader)
+            scheduler.step(avg_val_loss)
+
+            # --- VISU: Sauvegarde de l'image témoin TOUTES LES 10 EPOCHS ---
+            if (epoch + 1) % 2 == 0:
+                with torch.no_grad():
+                    # 1. Génération
+                    fake_img_tensor = self.netG(fixed_ske)
+
+                    # 2. Conversion Tensor -> Numpy RGB
+                    img_to_save = self.dataset.tensor2image(fake_img_tensor[0])
+
+                    # 3. Conversion RGB -> BGR (Obligatoire pour OpenCV)
+                    img_to_save = cv2.cvtColor(img_to_save, cv2.COLOR_RGB2BGR)
+
+                    # 4. Sauvegarde directe
+                    filename = f"images_suivi/epoch_{epoch + 1}.jpg"
+                    cv2.imwrite(filename, img_to_save)
+                    print(f"  [Disk] Image sauvegardée : {filename}")
+            # ---------------------------------------------------------
+
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                torch.save(self.netG.state_dict(), self.filename)
+                print(f"\n[✓] Save: {avg_val_loss:.4f}")
+            else:
+                print(f"\n[ ] Train: {avg_train_loss:.4f} | Val: {avg_val_loss:.4f}")
+
+
+    def verify_alignment(filename, crop_ratio):
+        print(f"--- VÉRIFICATION ALIGNEMENT (Crop Ratio: {crop_ratio}) ---")
+
+        # 1. On charge la vidéo et on force le recalcul pour être sûr
+        # forceCompute=True est vital ici pour voir tes dernières modifs (Shift, Crop, etc.)
+        video_ske = VideoSkeleton(filename, cropRatio=crop_ratio, forceCompute=True,modFrame=100)
+
+        # 2. On crée le Dataset (comme pour l'entraînement)
+        # ske_reduced=True car c'est ce que tu utilises pour l'entrainement
+        dataset = VideoSkeletonDataset(video_ske, ske_reduced=True)
+
+        print(f"Nombre d'images chargées : {len(dataset)}")
+        print("Appuie sur 'Espace' pour passer à l'image suivante.")
+        print("Appuie sur 'Q' pour quitter.")
+
+        # On parcourt quelques images (pas forcément toutes)
+        for i in range(len(dataset)):
+            # Récupération des données brutes du dataset
+            ske_tensor, pil_image = dataset[i]
+
+            # --- A. PRÉPARATION DE L'IMAGE ---
+            # Le dataset renvoie une image PIL, on la convertit en OpenCV (BGR)
+            image_cv = np.array(pil_image)
+            image_cv = cv2.cvtColor(image_cv, cv2.COLOR_RGB2BGR)
+
+            # --- B. PRÉPARATION DU SQUELETTE ---
+            # Le dataset renvoie un Tensor plat (ex: 26 valeurs).
+            # On doit le remettre en forme (13 points, 2 coordonnées x,y)
+            ske_numpy = ske_tensor.numpy()
+
+            # On reforme le tableau (N points, 2 coordonnées)
+            # Si ske_reduced=True, on a 26 valeurs -> 13 points
+            ske_reshaped = ske_numpy.reshape((-1, 2))
+
+            # --- C. DESSIN ET VERIFICATION ---
+            # On utilise la fonction statique de ta classe Skeleton pour dessiner
+            # Elle attend des coordonnées normalisées (0-1) et va les multiplier par la taille de l'image
+            Skeleton.draw_reduced(ske_reshaped, image_cv)
+
+            # On redimensionne un peu pour bien voir sur ton écran (zoom x2)
+            h, w = image_cv.shape[:2]
+            image_zoom = cv2.resize(image_cv, (w * 2, h * 2), interpolation=cv2.INTER_NEAREST)
+
+            # Affichage
+            cv2.imshow("Verification Alignement", image_zoom)
+
+            key = cv2.waitKey(0)  # Attend une touche indéfiniment
+            if key & 0xFF == ord('q'):
+                break
+
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
-    force = False
-    optSkeOrImage = 2
-    n_epoch = 200
-    train = True
+    # Mets ici le chemin de ta vidéo
+    video_file = "../data/raw/taichi1.mp4"
 
-    if len(sys.argv) > 1:
-        filename = sys.argv[1]
-        if len(sys.argv) > 2:
-            force = sys.argv[2].lower() == "true"
-    else:
-        filename = "data/raw/taichi1.mp4"
-
-    print("GenVanillaNN: Filename=", filename)
-    targetVideoSke = VideoSkeleton(filename)
-
-    if train:
-        gen = GenVanillaNN(targetVideoSke, loadFromFile=False, optSkeOrImage=optSkeOrImage)
-        gen.train(n_epoch)
-    else:
-        gen = GenVanillaNN(targetVideoSke, loadFromFile=True, optSkeOrImage=optSkeOrImage)
-
-    for i in range(targetVideoSke.skeCount()):
-        image = gen.generate(targetVideoSke.ske[i])
-        image = cv2.resize(image, (256, 256))
-        cv2.imshow("Image", image)
-        key = cv2.waitKey(-1)
+    # Mets ici LE MÊME ratio que celui que tu veux utiliser (ex: 1.3 ou 1.5)
+    GenVanillaNN.verify_alignment(video_file, crop_ratio=1.3)

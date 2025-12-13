@@ -43,10 +43,14 @@ class Skeleton:
                 self.ske[i] = Vec3(0,0,0)
 
     def __str__(self):          
-        return str(self.ske)        
-    
-    def __array__(self, dtype=None):
-        return np.vstack(self.ske).astype(float)
+        return str(self.ske)
+
+    def __array__(self, dtype=None, reduced=False):
+        """ return skeleton as a numpy array of float, if reduced is True, keep only 13 minimals joints """
+        if reduced:
+            return np.vstack(self.ske[self.reduce_indice]).astype(float)[:, :2]
+        else:
+            return np.vstack(self.ske).astype(float)
     
     def toarray(self, reduced=False):
         if reduced:
@@ -157,7 +161,7 @@ class Skeleton:
             # Conversion explicite en tuple d'entiers pour OpenCV
             pt1 = (int(p1[0]), int(p1[1]))
             pt2 = (int(p2[0]), int(p2[1]))
-            cv2.line(image, pt1, pt2, Skeleton.color(col_idx), 4)
+            cv2.line(image, pt1, pt2, Skeleton.color(col_idx), 1)
 
 class SkeletonSmoother:
     """ Average moving filter for skeleton stability """
@@ -178,3 +182,21 @@ class SkeletonSmoother:
         arr = np.array(self.history)
         smoothed = np.mean(arr, axis=0)
         return smoothed
+
+if __name__ == '__main__':
+    s = Skeleton()
+    print("Current Working Directory:", os.getcwd())
+    image = cv2.imread("../data/raw/image14000.jpg")
+    if image is None:
+        print('Lecture de l\'image a échoué.')
+    #image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    s.fromImage(image)
+    #print(s)
+    print( "landmarks:", s )
+    print( "landmarks as np:", s.__array__() )
+    print( "landmarks as np:", s.__array__(reduced=True) )
+
+    s.draw(image)
+    cv2.imshow('Image', image)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
