@@ -8,7 +8,7 @@ import math
 from PIL import Image
 import matplotlib.pyplot as plt
 from torchvision.io import read_image
-
+from torchvision import models
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
@@ -168,24 +168,73 @@ class GenNNSke26ToImage(nn.Module):
         return img
 
 
+
+
+
+class VGGPerceptualLoss(nn.Module):
+    def __init__(self, resize=True):
+        super(VGGPerceptualLoss, self).__init__()
+        # On utilise VGG16 (plus léger que le 19 pour ta 4060)
+        vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1).features
+
+        # On découpe le réseau pour récupérer les textures à différents niveaux
+        self.blocks = nn.ModuleList([
+            vgg[:4],  # Niveau 1 : Traits fins
+            vgg[4:9],  # Niveau 2 : Formes
+            vgg[9:16],  # Niveau 3 : Textures complexes
+            vgg[16:23]  # Niveau 4 : Structure globale
+        ])
+
+        # On gèle les poids (VGG ne s'entraîne pas, il juge seulement)
+        for param in self.parameters():
+            param.requires_grad = False
+
+        # Normalisation standard ImageNet (Indispensable pour que VGG comprenne l'image)
+        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+
+    def forward(self, input, target):
+        # Si l'image est en Noir & Blanc, on la duplique pour faire du RGB
+        if input.shape[1] != 3:
+            input = input.repeat(1, 3, 1, 1)
+            target = target.repeat(1, 3, 1, 1)
+
+        # On normalise les images
+        input = (input - self.mean.to(input.device)) / self.std.to(input.device)
+        target = (target - self.mean.to(target.device)) / self.std.to(target.device)
+
+        loss = 0.0
+        x = input
+        y = target
+
+        # On compare les "features" à chaque étape
+        for block in self.blocks:
+            x = block(x)
+            y = block(y)
+            loss += torch.nn.functional.l1_loss(x, y)
+
+        return loss
+
 class ResidualBlock(nn.Module):
     """
-    Un bloc qui permet au réseau d'apprendre plus de détails
-    sans perdre l'information originale.
+    Version optimisée avec InstanceNorm et SpectralNorm
     """
 
     def __init__(self, in_channels):
         super(ResidualBlock, self).__init__()
         self.block = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(in_channels),
+            # Spectral Norm aide à stabiliser la structure
+            nn.utils.spectral_norm(nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, bias=True)),
+            # InstanceNorm est MEILLEUR que BatchNorm pour la génération d'images
+            nn.InstanceNorm2d(in_channels, affine=True),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(in_channels)
+
+            nn.utils.spectral_norm(nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, bias=True)),
+            nn.InstanceNorm2d(in_channels, affine=True)
         )
 
     def forward(self, x):
-        return x + self.block(x)  # On ajoute l'entrée à la sortie (Skip Connection locale)
+        return x + self.block(x)
 
 
 class GenNNSkeImToImage(nn.Module):
@@ -193,77 +242,76 @@ class GenNNSkeImToImage(nn.Module):
         super().__init__()
 
         # --- ENCODER ---
-        # On garde la structure 32 -> 64 -> 128 -> 256 pour la vitesse
-
-        # E1: 3 -> 32
+        # Note: On n'utilise pas SpectralNorm sur la toute première couche (couleurs brutes)
         self.enc1 = nn.Sequential(
             nn.Conv2d(3, 32, 3, 1, 1, bias=False),
-            nn.BatchNorm2d(32), nn.LeakyReLU(0.2, inplace=True),
-            ResidualBlock(32),  # Ajout de "mémoire"
-            nn.Conv2d(32, 32, 4, 2, 1, bias=False),  # Downsample
-            nn.BatchNorm2d(32), nn.LeakyReLU(0.2, inplace=True)
+            nn.InstanceNorm2d(32, affine=True), nn.LeakyReLU(0.2, inplace=True),
+            ResidualBlock(32),
+            # Downsample
+            nn.utils.spectral_norm(nn.Conv2d(32, 32, 4, 2, 1, bias=False)),
+            nn.InstanceNorm2d(32, affine=True), nn.LeakyReLU(0.2, inplace=True)
         )
 
-        # E2: 32 -> 64
         self.enc2 = nn.Sequential(
-            nn.Conv2d(32, 64, 3, 1, 1, bias=False),
-            nn.BatchNorm2d(64), nn.LeakyReLU(0.2, inplace=True),
+            nn.utils.spectral_norm(nn.Conv2d(32, 64, 3, 1, 1, bias=False)),
+            nn.InstanceNorm2d(64, affine=True), nn.LeakyReLU(0.2, inplace=True),
             ResidualBlock(64),
-            nn.Conv2d(64, 64, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(64), nn.LeakyReLU(0.2, inplace=True)
+            nn.utils.spectral_norm(nn.Conv2d(64, 64, 4, 2, 1, bias=False)),
+            nn.InstanceNorm2d(64, affine=True), nn.LeakyReLU(0.2, inplace=True)
         )
 
-        # E3: 64 -> 128
         self.enc3 = nn.Sequential(
-            nn.Conv2d(64, 128, 3, 1, 1, bias=False),
-            nn.BatchNorm2d(128), nn.LeakyReLU(0.2, inplace=True),
+            nn.utils.spectral_norm(nn.Conv2d(64, 128, 3, 1, 1, bias=False)),
+            nn.InstanceNorm2d(128, affine=True), nn.LeakyReLU(0.2, inplace=True),
             ResidualBlock(128),
-            nn.Conv2d(128, 128, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(128), nn.LeakyReLU(0.2, inplace=True)
+            nn.utils.spectral_norm(nn.Conv2d(128, 128, 4, 2, 1, bias=False)),
+            nn.InstanceNorm2d(128, affine=True), nn.LeakyReLU(0.2, inplace=True)
         )
 
-        # E4 (Bottleneck): 128 -> 256
+        # Bottleneck
         self.enc4 = nn.Sequential(
-            nn.Conv2d(128, 256, 3, 1, 1, bias=False),
-            nn.BatchNorm2d(256), nn.LeakyReLU(0.2, inplace=True),
+            nn.utils.spectral_norm(nn.Conv2d(128, 256, 3, 1, 1, bias=False)),
+            nn.InstanceNorm2d(256, affine=True), nn.LeakyReLU(0.2, inplace=True),
             ResidualBlock(256),
-            ResidualBlock(256),  # Double dose pour le bottleneck
-            nn.Conv2d(256, 256, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(256), nn.LeakyReLU(0.2, inplace=True)
+            ResidualBlock(256),
+            nn.utils.spectral_norm(nn.Conv2d(256, 256, 4, 2, 1, bias=False)),
+            nn.InstanceNorm2d(256, affine=True), nn.LeakyReLU(0.2, inplace=True)
         )
 
-        # --- DECODER (Amélioré : Upsample + Conv) ---
+        # --- DECODER (Optimisé : Nearest Neighbor) ---
 
         # D1: 256 -> 128
-        self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        # Mode 'nearest' est souvent plus net que 'bilinear' pour les GANs/VGG
+        self.up1 = nn.Upsample(scale_factor=2, mode='nearest')
         self.dec1 = nn.Sequential(
-            nn.Conv2d(256, 128, 3, 1, 1, bias=False),
-            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            nn.utils.spectral_norm(nn.Conv2d(256, 128, 3, 1, 1, bias=False)),
+            nn.InstanceNorm2d(128, affine=True), nn.ReLU(inplace=True),
             ResidualBlock(128)
         )
 
         # D2: 256 (128+128 cat) -> 64
-        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.up2 = nn.Upsample(scale_factor=2, mode='nearest')
         self.dec2 = nn.Sequential(
-            nn.Conv2d(256, 64, 3, 1, 1, bias=False),
-            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            nn.utils.spectral_norm(nn.Conv2d(256, 64, 3, 1, 1, bias=False)),
+            nn.InstanceNorm2d(64, affine=True), nn.ReLU(inplace=True),
             ResidualBlock(64)
         )
 
         # D3: 128 (64+64 cat) -> 32
-        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.up3 = nn.Upsample(scale_factor=2, mode='nearest')
         self.dec3 = nn.Sequential(
-            nn.Conv2d(128, 32, 3, 1, 1, bias=False),
-            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+            nn.utils.spectral_norm(nn.Conv2d(128, 32, 3, 1, 1, bias=False)),
+            nn.InstanceNorm2d(32, affine=True), nn.ReLU(inplace=True),
             ResidualBlock(32)
         )
 
         # D4: 64 (32+32 cat) -> 3
-        self.up4 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.up4 = nn.Upsample(scale_factor=2, mode='nearest')
         self.dec4 = nn.Sequential(
-            nn.Conv2d(64, 32, 3, 1, 1, bias=False),
-            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
-            nn.Conv2d(32, 3, 3, 1, 1),  # Sortie finale
+            nn.utils.spectral_norm(nn.Conv2d(64, 32, 3, 1, 1, bias=False)),
+            nn.InstanceNorm2d(32, affine=True), nn.ReLU(inplace=True),
+            # Pas de Norm sur la dernière couche, on veut juste la couleur
+            nn.Conv2d(32, 3, 3, 1, 1),
             nn.Tanh()
         )
 
@@ -275,22 +323,18 @@ class GenNNSkeImToImage(nn.Module):
         e4 = self.enc4(e3)
 
         # Decoder
-        # D1
-        d1 = self.up1(e4)  # On agrandit d'abord
-        d1 = self.dec1(d1)  # Puis on traite
+        d1 = self.up1(e4)
+        d1 = self.dec1(d1)
         d1_cat = torch.cat([d1, e3], dim=1)
 
-        # D2
         d2 = self.up2(d1_cat)
         d2 = self.dec2(d2)
         d2_cat = torch.cat([d2, e2], dim=1)
 
-        # D3
         d3 = self.up3(d2_cat)
         d3 = self.dec3(d3)
         d3_cat = torch.cat([d3, e1], dim=1)
 
-        # D4
         d4 = self.up4(d3_cat)
         output = self.dec4(d4)
 
@@ -374,15 +418,20 @@ class GenVanillaNN:
             # ------------------------------------------------
 
             return bgr_image
-    def train(self, n_epochs=20):
-        print(f"[TRAIN] Début de l'entraînement sur {self.device}")
 
-        batch_size = 256
+    def train(self, n_epochs=200):  # Je conseille 200 car VGG affine doucement
+        print(f"[TRAIN] Début de l'entraînement (L1 + VGG Perceptual) sur {self.device}")
+
+        # --- ATTENTION : Batch Size réduit pour VGG ---
+        # VGG consomme beaucoup de VRAM. Sur RTX 4060, on met 16.
+        # Si tu as une erreur "Out of Memory", descends à 8.
+        batch_size = 128
 
         train_size = int(0.85 * len(self.dataset))
         val_size = len(self.dataset) - train_size
         train_dataset, val_dataset = torch.utils.data.random_split(self.dataset, [train_size, val_size])
 
+        # num_workers=0 car tes données sont en RAM (Dataset optimisé)
         num_workers = 0
 
         train_loader = DataLoader(
@@ -405,16 +454,19 @@ class GenVanillaNN:
             os.makedirs("images_suivi")
         # ---------------------------------------------------------
 
-        criterion_mse = nn.MSELoss()
+        # --- INITIALISATION DES LOSS ---
         criterion_l1 = nn.L1Loss()
+
+        # On initialise le Juge VGG
+        print("[TRAIN] Chargement du VGG pour la netteté...")
+        criterion_vgg = VGGPerceptualLoss().to(self.device)
+
         optimizer = optim.Adam(self.netG.parameters(), lr=0.0002, betas=(0.5, 0.999))
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
 
         scaler = torch.cuda.amp.GradScaler()
 
         best_val_loss = float("inf")
-
-        # J'AI SUPPRIMÉ LES LIGNES cv2.namedWindow ICI !
 
         for epoch in range(n_epochs):
             self.netG.train()
@@ -429,9 +481,14 @@ class GenVanillaNN:
 
                 with torch.amp.autocast("cuda"):
                     outputs = self.netG(inputs)
-                    loss_mse = criterion_mse(outputs, targets)
-                    loss_l1 = criterion_l1(outputs, targets)
-                    loss = 0.6 * loss_mse + 0.4 * loss_l1
+
+                    # --- NOUVELLE FORMULE DE LOSS ---
+                    loss_l1_val = criterion_l1(outputs, targets)
+                    loss_vgg_val = criterion_vgg(outputs, targets)
+
+                    # Formule magique : Structure (L1) + Texture (VGG)
+                    # On met un poids fort sur L1 pour garder la pose correcte
+                    loss = 10.0 * loss_l1_val + 1.0 * loss_vgg_val
 
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -441,7 +498,10 @@ class GenVanillaNN:
                 batch_count += 1
 
                 if i % 10 == 0:
-                    print(f"\rEpoch {epoch + 1} [{i}/{len(train_loader)}] Loss: {loss.item():.4f}", end="")
+                    # On affiche les deux détails (L1 et VGG) pour comprendre ce qui se passe
+                    print(
+                        f"\rEpoch {epoch + 1} [{i}/{len(train_loader)}] Loss: {loss.item():.4f} (L1:{loss_l1_val:.3f} VGG:{loss_vgg_val:.3f})",
+                        end="")
 
             avg_train_loss = running_loss / batch_count
 
@@ -455,13 +515,17 @@ class GenVanillaNN:
 
                     with torch.amp.autocast("cuda"):
                         outputs = self.netG(inputs)
-                        loss = 0.6 * criterion_mse(outputs, targets) + 0.4 * criterion_l1(outputs, targets)
+                        # On valide avec la même métrique
+                        l1 = criterion_l1(outputs, targets)
+                        vgg = criterion_vgg(outputs, targets)
+                        loss = 10.0 * l1 + 1.0 * vgg
+
                     val_loss += loss.item()
 
             avg_val_loss = val_loss / len(val_loader)
             scheduler.step(avg_val_loss)
 
-            # --- VISU: Sauvegarde de l'image témoin TOUTES LES 10 EPOCHS ---
+            # --- VISU: Sauvegarde de l'image témoin TOUTES LES 2 EPOCHS (Comme tu voulais) ---
             if (epoch + 1) % 2 == 0:
                 with torch.no_grad():
                     # 1. Génération

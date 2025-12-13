@@ -117,13 +117,13 @@ def step_extract():
         mod = int(mod)
         print_header("EXTRACTION EN COURS...")
         print_info(f"Traitement de : {os.path.basename(video_path)}")
-        print_info(f"Mode : 1 frame sur {5}")
+        print_info(f"Mode : 1 frame sur {mod}")
         print_info("Cela peut prendre quelques minutes selon la durée de la vidéo...")
         
         start_time = time.time()
         
         # Lancement du calcul
-        vs = VideoSkeleton(video_path, forceCompute=True, modFrame=5,cropRatio=1.3,newVideoWidth=128)
+        vs = VideoSkeleton(video_path, forceCompute=True, modFrame=mod,cropRatio=1.3,newVideoWidth=128)
         
         duration = time.time() - start_time
         

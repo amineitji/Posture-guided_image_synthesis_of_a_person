@@ -161,7 +161,7 @@ class Skeleton:
             # Conversion explicite en tuple d'entiers pour OpenCV
             pt1 = (int(p1[0]), int(p1[1]))
             pt2 = (int(p2[0]), int(p2[1]))
-            cv2.line(image, pt1, pt2, Skeleton.color(col_idx), 1)
+            cv2.line(image, pt1, pt2, Skeleton.color(col_idx), 2)
 
 class SkeletonSmoother:
     """ Average moving filter for skeleton stability """
