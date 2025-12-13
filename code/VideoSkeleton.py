@@ -74,7 +74,7 @@ class VideoSkeleton:
     """ 
     Class that associate a skeleton to each frame of a video
     """
-    def __init__(self, filename, forceCompute=False, modFrame=10, newVideoWidth=128, cropRatio=1.3, isCrop=True):
+    def __init__(self, filename, forceCompute=False, modFrame=3, newVideoWidth=128, cropRatio=1.3, isCrop=True):
         self.mod_frame = modFrame
         self.cropRatio = cropRatio  # <--- AJOUTER CETTE LIGNE
         self.new_video_width = newVideoWidth  # <--- AJOUTER CETTE LIGNE

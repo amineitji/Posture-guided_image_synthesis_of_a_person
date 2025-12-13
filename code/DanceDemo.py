@@ -15,7 +15,7 @@ class DanceDemo:
         if filename_tgt is None: filename_tgt = "data/processed/taichi1.pkl"
         
         print(f"[DanceDemo] Chargement...")
-        self.target = VideoSkeleton(filename_tgt)
+        self.target = VideoSkeleton(filename_tgt,cropRatio=1.3,modFrame=3)
         self.source = VideoReader(filename_src)
         self.smoother = SkeletonSmoother(window_size=5)
 
