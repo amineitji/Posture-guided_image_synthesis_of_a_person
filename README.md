@@ -18,10 +18,10 @@ pour amelioere notre vanilla on est partie des tecthnique qu'on a vue lors des p
 
 # extractions des images
 
-- meilleur compromis choix de 3 image par par seconde parce les images mouvement sont lent il n'y pas de difference entre les images en peu de temps
+- meilleur compromis choix de 3 image  par seconde parce les images mouvement sont lent il n'y pas de difference entre les images en peu de temps
 et on a assez de donnes 4989 images/ske pour l'entrainement
 
-- uniformisations du padding de l'image 
+- uniformisations du padding de l'image. à cause cropske il y avait le padding qui se deplacet dans l'image 
 
 - reduction de l'epaisseur du skelette pour mieux voir les mouvement
 

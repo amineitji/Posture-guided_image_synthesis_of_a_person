@@ -122,24 +122,6 @@ class VideoSkeletonDataset(Dataset):
         return numpy_image.clip(0, 255).astype(np.uint8)
 
 
-class SelfAttention(nn.Module):
-    def __init__(self, in_dim):
-        super().__init__()
-        self.query = nn.Conv2d(in_dim, in_dim // 8, 1)
-        self.key = nn.Conv2d(in_dim, in_dim // 8, 1)
-        self.value = nn.Conv2d(in_dim, in_dim, 1)
-        self.gamma = nn.Parameter(torch.zeros(1))
-
-    def forward(self, x):
-        B, C, H, W = x.size()
-        proj_query = self.query(x).view(B, -1, H * W).permute(0, 2, 1)
-        proj_key = self.key(x).view(B, -1, H * W)
-        energy = torch.bmm(proj_query, proj_key)
-        attention = torch.softmax(energy, dim=-1)
-        proj_value = self.value(x).view(B, C, H * W)
-        out = torch.bmm(proj_value, attention.permute(0, 2, 1))
-        out = out.view(B, C, H, W)
-        return self.gamma * out + x
 
 
 class GenNNSke26ToImage(nn.Module):
@@ -168,200 +150,242 @@ class GenNNSke26ToImage(nn.Module):
         return img
 
 
-
-
-
 class VGGPerceptualLoss(nn.Module):
     def __init__(self, resize=True):
         super(VGGPerceptualLoss, self).__init__()
-        # On utilise VGG16 (plus léger que le 19 pour ta 4060)
+        # VGG16 Features
         vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1).features
 
-        # On découpe le réseau pour récupérer les textures à différents niveaux
+        # Blocs de features
         self.blocks = nn.ModuleList([
-            vgg[:4],  # Niveau 1 : Traits fins
-            vgg[4:9],  # Niveau 2 : Formes
-            vgg[9:16],  # Niveau 3 : Textures complexes
-            vgg[16:23]  # Niveau 4 : Structure globale
+            vgg[:4],  # Texture fine
+            vgg[4:9],  # Formes
+            vgg[9:16],  # Textures complexes
+            vgg[16:23]  # Structure globale
         ])
 
-        # On gèle les poids (VGG ne s'entraîne pas, il juge seulement)
+        # On gèle les poids
         for param in self.parameters():
             param.requires_grad = False
 
-        # Normalisation standard ImageNet (Indispensable pour que VGG comprenne l'image)
+        # Moyenne et Std ImageNet
         self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
         self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
     def forward(self, input, target):
-        # Si l'image est en Noir & Blanc, on la duplique pour faire du RGB
-        if input.shape[1] != 3:
-            input = input.repeat(1, 3, 1, 1)
-            target = target.repeat(1, 3, 1, 1)
+        # --- SÉCURITÉ MIXED PRECISION ---
+        # On force le calcul en Float32 pour éviter les NaN
+        with torch.cuda.amp.autocast(enabled=False):
 
-        # On normalise les images
-        input = (input - self.mean.to(input.device)) / self.std.to(input.device)
-        target = (target - self.mean.to(target.device)) / self.std.to(target.device)
+            # 1. On s'assure que c'est du Float32
+            input = input.float()
+            target = target.float()
 
-        loss = 0.0
-        x = input
-        y = target
+            # 2. Gestion Noir & Blanc -> RGB
+            if input.shape[1] != 3:
+                input = input.repeat(1, 3, 1, 1)
+                target = target.repeat(1, 3, 1, 1)
 
-        # On compare les "features" à chaque étape
-        for block in self.blocks:
-            x = block(x)
-            y = block(y)
-            loss += torch.nn.functional.l1_loss(x, y)
+            # 3. CORRECTION CRITIQUE : [-1, 1] -> [0, 1]
+            # On remet les pixels dans le range que VGG comprend
+            input = (input + 1) / 2
+            target = (target + 1) / 2
 
-        return loss
+            # 4. Normalisation ImageNet (Maintenant c'est mathématiquement juste)
+            input = (input - self.mean.to(input.device)) / self.std.to(input.device)
+            target = (target - self.mean.to(target.device)) / self.std.to(target.device)
 
-class ResidualBlock(nn.Module):
+            loss = 0.0
+            x = input
+            y = target
+
+            for block in self.blocks:
+                x = block(x)
+                y = block(y)
+                loss += torch.nn.functional.l1_loss(x, y)
+
+            return loss
+
+
+class SpatialAttention(nn.Module):
     """
-    Version optimisée avec InstanceNorm et SpectralNorm
+    Version Ultra-Légère (CBAM)
+    Remplace la Self-Attention lourde.
+    Elle ne coûte presque rien en mémoire mais force le réseau
+    à se concentrer sur la structure du squelette.
     """
 
-    def __init__(self, in_channels):
-        super(ResidualBlock, self).__init__()
-        self.block = nn.Sequential(
-            # Spectral Norm aide à stabiliser la structure
-            nn.utils.spectral_norm(nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, bias=True)),
-            # InstanceNorm est MEILLEUR que BatchNorm pour la génération d'images
-            nn.InstanceNorm2d(in_channels, affine=True),
-            nn.LeakyReLU(0.2, inplace=True),
-
-            nn.utils.spectral_norm(nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, bias=True)),
-            nn.InstanceNorm2d(in_channels, affine=True)
-        )
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        # On compresse tout en 2 canaux (Moyenne + Max)
+        # Puis on utilise une convolution large (7x7) pour voir la forme globale
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        return x + self.block(x)
+        # 1. On cherche les infos importantes sur tous les canaux
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
 
+        # 2. On combine (Concaténation)
+        x_cat = torch.cat([avg_out, max_out], dim=1)
+
+        # 3. On crée la "Carte d'importance" (entre 0 et 1)
+        scale = self.conv(x_cat)
+        scale = self.sigmoid(scale)
+
+        # 4. On applique le masque à l'entrée
+        return x * scale
 
 class ResnetBlock(nn.Module):
-    # Le bloc standard des papiers CycleGAN / Pix2PixHD
     def __init__(self, dim):
         super(ResnetBlock, self).__init__()
         self.conv_block = nn.Sequential(
             nn.ReflectionPad2d(1),
-            # CORRECTION : on spécifie stride=1 et padding=0 explicitement
-            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0),
-            nn.InstanceNorm2d(dim),
-            nn.ReLU(True),
+            # Optimisation: bias=False car InstanceNorm suit
+            nn.Conv2d(dim, dim, 3, 1, 0, bias=False),
+            nn.InstanceNorm2d(dim, affine=True),
+            nn.ReLU(inplace=True), # Optimisation mémoire
 
             nn.ReflectionPad2d(1),
-            # CORRECTION ICI AUSSI
-            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0),
-            nn.InstanceNorm2d(dim)
+            nn.Conv2d(dim, dim, 3, 1, 0, bias=False),
+            nn.InstanceNorm2d(dim, affine=True)
         )
 
     def forward(self, x):
         return x + self.conv_block(x)
 
+
 class GenNNSkeImToImage(nn.Module):
     def __init__(self):
         super().__init__()
 
-        # --- ENCODER (Downsampling) ---
-        # Le standard: Conv -> InstanceNorm -> ReLU
+        # --- ENCODER (LeakyReLU + bias=False) ---
         self.enc1 = nn.Sequential(
             nn.ReflectionPad2d(3),
-            nn.Conv2d(3, 64, 7, 1, 0),  # Grosse convolution au début pour capter l'ensemble
-            nn.InstanceNorm2d(64), nn.ReLU(True)
+            nn.Conv2d(3, 64, 7, 1, 0, bias=False),
+            nn.InstanceNorm2d(64),
+            nn.LeakyReLU(0.2, inplace=True) # Important pour ne pas perdre d'info
         )
 
         self.down1 = nn.Sequential(
-            nn.Conv2d(64, 128, 3, 2, 1),  # Stride 2 = Downsample
-            nn.InstanceNorm2d(128), nn.ReLU(True)
+            nn.Conv2d(64, 128, 3, 2, 1, bias=False),
+            nn.InstanceNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True)
         )
         self.down2 = nn.Sequential(
-            nn.Conv2d(128, 256, 3, 2, 1),
-            nn.InstanceNorm2d(256), nn.ReLU(True)
+            nn.Conv2d(128, 256, 3, 2, 1, bias=False),
+            nn.InstanceNorm2d(256),
+            nn.LeakyReLU(0.2, inplace=True)
         )
         self.down3 = nn.Sequential(
-            nn.Conv2d(256, 512, 3, 2, 1),
-            nn.InstanceNorm2d(512), nn.ReLU(True)
+            nn.Conv2d(256, 512, 3, 2, 1, bias=False),
+            nn.InstanceNorm2d(512),
+            nn.LeakyReLU(0.2, inplace=True)
         )
 
-        # --- BOTTLENECK (ResNet) ---
-        # Pix2PixHD recommande 6 à 9 blocs ici pour bien comprendre la structure
-        # C'est ici que la magie opère
+        # --- BOTTLENECK ---
+        # 32x32 pixels, 512 canaux
         self.bottleneck = nn.Sequential(
             ResnetBlock(512),
             ResnetBlock(512),
             ResnetBlock(512),
-            ResnetBlock(512),  # On en met 4 pour rester léger sur ta 4060
+            ResnetBlock(512),
         )
 
-        # --- DECODER (Upsampling "Resize-Conv") ---
-        # C'est LA solution "selon les papiers" pour éviter la pixelisation
+        # === ATTENTION ===
+        # Optimisée: sur 512 canaux (info riche) mais petite taille (32x32)
+        self.attn = SpatialAttention()
+        # =================
+
+        # --- DECODER (ReLU + bias=False) ---
 
         # Up 1 : 512 -> 256
         self.up1 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),  # Lisse
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             nn.ReflectionPad2d(1),
-            nn.Conv2d(512, 256, 3, 1, 0),  # Raffine
+            nn.Conv2d(512, 256, 3, 1, 0, bias=False),
             nn.InstanceNorm2d(256),
-            nn.ReLU(True)
+            nn.ReLU(inplace=True) # ReLU classique pour nettoyer l'image
         )
 
         # Up 2 : 256 -> 128
         self.up2 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             nn.ReflectionPad2d(1),
-            nn.Conv2d(256 + 256, 128, 3, 1, 0),  # +256 à cause du Skip Connection (cat)
+            # Input 512 car concat (256 + 256)
+            nn.Conv2d(512, 128, 3, 1, 0, bias=False),
             nn.InstanceNorm2d(128),
-            nn.ReLU(True)
+            nn.ReLU(inplace=True)
         )
 
         # Up 3 : 128 -> 64
         self.up3 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             nn.ReflectionPad2d(1),
-            nn.Conv2d(128 + 128, 64, 3, 1, 0),
+            # Input 256 car concat (128 + 128)
+            nn.Conv2d(256, 64, 3, 1, 0, bias=False),
             nn.InstanceNorm2d(64),
-            nn.ReLU(True)
+            nn.ReLU(inplace=True)
         )
 
         # Final
         self.final = nn.Sequential(
             nn.ReflectionPad2d(3),
-            nn.Conv2d(64 + 64, 3, 7, 1, 0),
+            # Input 128 car concat (64 + 64)
+            # Pas de bias=False ici car pas de Norm derrière (c'est Tanh direct)
+            nn.Conv2d(128, 3, 7, 1, 0),
             nn.Tanh()
         )
 
     def forward(self, x):
         # Encoder
-        x1 = self.enc1(x)  # 64
-        x2 = self.down1(x1)  # 128
-        x3 = self.down2(x2)  # 256
-        x4 = self.down3(x3)  # 512
+        x1 = self.enc1(x)       # 64
+        x2 = self.down1(x1)     # 128
+        x3 = self.down2(x2)     # 256
+        x4 = self.down3(x3)     # 512 (32px)
 
         # Bottleneck
-        b = self.bottleneck(x4)  # 512
+        b = self.bottleneck(x4) # 512 (32px)
 
-        # Decoder + Skip Connections (U-Net)
-        # Attention aux concaténations : on recolle les morceaux de l'encodeur
+        # Attention (Juste au bon endroit)
+        b = self.attn(b)
 
-        # Pas de skip sur le niveau le plus profond (classique Pix2Pix)
-        u1 = self.up1(b)  # 256
+        # Decoder
+        u1 = self.up1(b)        # 256 (64px)
 
-        u1_cat = torch.cat([u1, x3], dim=1)  # On recolle x3
-        u2 = self.up2(u1_cat)  # 128
+        u1_cat = torch.cat([u1, x3], dim=1)
+        u2 = self.up2(u1_cat)   # 128 (128px)
 
-        u2_cat = torch.cat([u2, x2], dim=1)  # On recolle x2
-        u3 = self.up3(u2_cat)  # 64
+        u2_cat = torch.cat([u2, x2], dim=1)
+        u3 = self.up3(u2_cat)   # 64  (256px)
 
-        u3_cat = torch.cat([u3, x1], dim=1)  # On recolle x1
-        output = self.final(u3_cat)
+        u3_cat = torch.cat([u3, x1], dim=1)
+        output = self.final(u3_cat) # RGB
 
         return output
 
+def weights_init(m):
+    classname = m.__class__.__name__
+    # Pour les Convolutions, on met une loi normale (moyenne 0, écart-type 0.02)
+    if classname.find('Conv') != -1:
+        nn.init.normal_(m.weight.data, 0.0, 0.02)
+        if hasattr(m, 'bias') and m.bias is not None:
+            nn.init.constant_(m.bias.data, 0.0)
+    # Pour le BatchNorm/InstanceNorm, on initialise à 1 (pas de changement) et biais 0
+    elif classname.find('BatchNorm2d') != -1 or classname.find('InstanceNorm2d') != -1:
+        # Note : InstanceNorm n'a parfois pas de paramètres learnable,
+        # mais si 'affine=True' est mis, cela aide.
+        if m.weight is not None:
+            nn.init.normal_(m.weight.data, 1.0, 0.02)
+        if m.bias is not None:
+            nn.init.constant_(m.bias.data, 0.0)
 
 class GenVanillaNN:
     def __init__(self, videoSke, loadFromFile=False, optSkeOrImage=1):
         # 128x128 est un bon compromis pour 8GB VRAM. 256x256 peut passer avec batch=8.
-        self.image_size = 128
-        image_size = 128
+        self.image_size = 256
+        image_size = 256
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         print(f"[GPU] Device: {self.device}")
 
@@ -377,7 +401,7 @@ class GenVanillaNN:
             # Les RTX 4000 sont beaucoup plus rapides si la mémoire est agencée en (N, H, W, C)
             self.netG = self.netG.to(memory_format=torch.channels_last)
             self.netG = self.netG.to(self.device)
-
+            self.netG.apply(weights_init)
             src_transform = transforms.Compose([
                 SkeToImageTransform(image_size),
                 transforms.ToTensor(),
@@ -409,6 +433,7 @@ class GenVanillaNN:
                 print("[✓] Modèle chargé avec succès")
             except Exception as e:
                 print(f"[✗] Erreur chargement: {e}")
+
 
     def generate(self, ske):
         self.netG.eval()
@@ -444,7 +469,7 @@ class GenVanillaNN:
         # --- ATTENTION : Batch Size réduit pour VGG ---
         # VGG consomme beaucoup de VRAM. Sur RTX 4060, on met 16.
         # Si tu as une erreur "Out of Memory", descends à 8.
-        batch_size = 64
+        batch_size = 16
 
         train_size = int(0.85 * len(self.dataset))
         val_size = len(self.dataset) - train_size

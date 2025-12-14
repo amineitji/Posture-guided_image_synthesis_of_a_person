@@ -74,7 +74,7 @@ class VideoSkeleton:
     """ 
     Class that associate a skeleton to each frame of a video
     """
-    def __init__(self, filename, forceCompute=False, modFrame=3, newVideoWidth=128, cropRatio=1.3, isCrop=True):
+    def __init__(self, filename, forceCompute=False, modFrame=3, newVideoWidth=256, cropRatio=1.3, isCrop=True):
         self.mod_frame = modFrame
         self.cropRatio = cropRatio  # <--- AJOUTER CETTE LIGNE
         self.new_video_width = newVideoWidth  # <--- AJOUTER CETTE LIGNE
@@ -274,7 +274,7 @@ if __name__ == '__main__':
 
     # 2. Chargement (forceCompute=False pour utiliser ce qui est déjà calculé)
     # Assure-toi que cropRatio est bien à 2.0 ici
-    s = VideoSkeleton(filename, forceCompute=False, newVideoWidth=256, cropRatio=2.0)
+    s = VideoSkeleton(filename, forceCompute=False, newVideoWidth=256, cropRatio=1.3)
 
     # 3. Vérification du nombre de squelettes
     count = s.skeCount()
