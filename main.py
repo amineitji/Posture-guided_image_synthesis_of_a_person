@@ -123,7 +123,7 @@ def step_extract():
         start_time = time.time()
         
         # Lancement du calcul
-        vs = VideoSkeleton(video_path, forceCompute=True, modFrame=mod,cropRatio=1.3,newVideoWidth=256)
+        vs = VideoSkeleton(video_path, forceCompute=True, modFrame=mod,cropRatio=1.3,newVideoWidth=128)
         
         duration = time.time() - start_time
         

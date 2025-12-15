@@ -153,215 +153,188 @@ class GenNNSke26ToImage(nn.Module):
 class VGGPerceptualLoss(nn.Module):
     def __init__(self, resize=True):
         super(VGGPerceptualLoss, self).__init__()
-        # VGG16 Features
+        # On utilise VGG16 (plus léger que le 19 pour ta 4060)
         vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1).features
 
-        # Blocs de features
+        # On découpe le réseau pour récupérer les textures à différents niveaux
         self.blocks = nn.ModuleList([
-            vgg[:4],  # Texture fine
-            vgg[4:9],  # Formes
-            vgg[9:16],  # Textures complexes
-            vgg[16:23]  # Structure globale
+            vgg[:4],  # Niveau 1 : Traits fins
+            vgg[4:9],  # Niveau 2 : Formes
+            vgg[9:16],  # Niveau 3 : Textures complexes
+            vgg[16:23]  # Niveau 4 : Structure globale
         ])
 
-        # On gèle les poids
+        # On gèle les poids (VGG ne s'entraîne pas, il juge seulement)
         for param in self.parameters():
             param.requires_grad = False
 
-        # Moyenne et Std ImageNet
+        # Normalisation standard ImageNet (Indispensable pour que VGG comprenne l'image)
         self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
         self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
     def forward(self, input, target):
-        # --- SÉCURITÉ MIXED PRECISION ---
-        # On force le calcul en Float32 pour éviter les NaN
-        with torch.cuda.amp.autocast(enabled=False):
+        # Si l'image est en Noir & Blanc, on la duplique pour faire du RGB
+        if input.shape[1] != 3:
+            input = input.repeat(1, 3, 1, 1)
+            target = target.repeat(1, 3, 1, 1)
 
-            # 1. On s'assure que c'est du Float32
-            input = input.float()
-            target = target.float()
+        # On normalise les images
+        input = (input - self.mean.to(input.device)) / self.std.to(input.device)
+        target = (target - self.mean.to(target.device)) / self.std.to(target.device)
 
-            # 2. Gestion Noir & Blanc -> RGB
-            if input.shape[1] != 3:
-                input = input.repeat(1, 3, 1, 1)
-                target = target.repeat(1, 3, 1, 1)
+        loss = 0.0
+        x = input
+        y = target
 
-            # 3. CORRECTION CRITIQUE : [-1, 1] -> [0, 1]
-            # On remet les pixels dans le range que VGG comprend
-            input = (input + 1) / 2
-            target = (target + 1) / 2
+        # On compare les "features" à chaque étape
+        for block in self.blocks:
+            x = block(x)
+            y = block(y)
+            loss += torch.nn.functional.l1_loss(x, y)
 
-            # 4. Normalisation ImageNet (Maintenant c'est mathématiquement juste)
-            input = (input - self.mean.to(input.device)) / self.std.to(input.device)
-            target = (target - self.mean.to(target.device)) / self.std.to(target.device)
-
-            loss = 0.0
-            x = input
-            y = target
-
-            for block in self.blocks:
-                x = block(x)
-                y = block(y)
-                loss += torch.nn.functional.l1_loss(x, y)
-
-            return loss
+        return loss
 
 
-class SpatialAttention(nn.Module):
-    """
-    Version Ultra-Légère (CBAM)
-    Remplace la Self-Attention lourde.
-    Elle ne coûte presque rien en mémoire mais force le réseau
-    à se concentrer sur la structure du squelette.
-    """
-
-    def __init__(self, kernel_size=7):
-        super(SpatialAttention, self).__init__()
-        # On compresse tout en 2 canaux (Moyenne + Max)
-        # Puis on utilise une convolution large (7x7) pour voir la forme globale
-        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
-        self.sigmoid = nn.Sigmoid()
+class SEBlock(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(SEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
-        # 1. On cherche les infos importantes sur tous les canaux
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
 
-        # 2. On combine (Concaténation)
-        x_cat = torch.cat([avg_out, max_out], dim=1)
-
-        # 3. On crée la "Carte d'importance" (entre 0 et 1)
-        scale = self.conv(x_cat)
-        scale = self.sigmoid(scale)
-
-        # 4. On applique le masque à l'entrée
-        return x * scale
 
 class ResnetBlock(nn.Module):
     def __init__(self, dim):
         super(ResnetBlock, self).__init__()
         self.conv_block = nn.Sequential(
-            nn.ReflectionPad2d(1),
-            # Optimisation: bias=False car InstanceNorm suit
-            nn.Conv2d(dim, dim, 3, 1, 0, bias=False),
-            nn.InstanceNorm2d(dim, affine=True),
-            nn.ReLU(inplace=True), # Optimisation mémoire
+            # Conv 1
+            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect', bias=False),
+            nn.InstanceNorm2d(dim),
+            nn.ReLU(True),
 
-            nn.ReflectionPad2d(1),
-            nn.Conv2d(dim, dim, 3, 1, 0, bias=False),
-            nn.InstanceNorm2d(dim, affine=True)
+            # Conv 2
+            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect', bias=False),
+            nn.InstanceNorm2d(dim),
+
+            # --- AJOUT SE BLOCK ICI ---
+            # Il recalibre les features avant de les réinjecter
+            SEBlock(dim)
         )
 
     def forward(self, x):
         return x + self.conv_block(x)
-
 
 class GenNNSkeImToImage(nn.Module):
     def __init__(self):
         super().__init__()
 
         # --- ENCODER (LeakyReLU + bias=False) ---
+
+        # Init : 3 -> 64
         self.enc1 = nn.Sequential(
-            nn.ReflectionPad2d(3),
-            nn.Conv2d(3, 64, 7, 1, 0, bias=False),
+            # Conv 7x7 avec reflection padding intégré
+            nn.Conv2d(3, 64, kernel_size=7, stride=1, padding=3, padding_mode='reflect', bias=False),
             nn.InstanceNorm2d(64),
-            nn.LeakyReLU(0.2, inplace=True) # Important pour ne pas perdre d'info
+            nn.LeakyReLU(0.2, inplace=True)  # inplace=True économise de la mémoire
         )
 
+        # Down 1 : 64 -> 128
         self.down1 = nn.Sequential(
-            nn.Conv2d(64, 128, 3, 2, 1, bias=False),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, padding_mode='reflect', bias=False),
             nn.InstanceNorm2d(128),
             nn.LeakyReLU(0.2, inplace=True)
         )
+
+        # Down 2 : 128 -> 256
         self.down2 = nn.Sequential(
-            nn.Conv2d(128, 256, 3, 2, 1, bias=False),
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1, padding_mode='reflect', bias=False),
             nn.InstanceNorm2d(256),
             nn.LeakyReLU(0.2, inplace=True)
         )
+
+        # Down 3 : 256 -> 512
         self.down3 = nn.Sequential(
-            nn.Conv2d(256, 512, 3, 2, 1, bias=False),
+            nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1, padding_mode='reflect', bias=False),
             nn.InstanceNorm2d(512),
             nn.LeakyReLU(0.2, inplace=True)
         )
 
         # --- BOTTLENECK ---
-        # 32x32 pixels, 512 canaux
         self.bottleneck = nn.Sequential(
             ResnetBlock(512),
             ResnetBlock(512),
             ResnetBlock(512),
-            ResnetBlock(512),
+            ResnetBlock(512)
         )
 
-        # === ATTENTION ===
-        # Optimisée: sur 512 canaux (info riche) mais petite taille (32x32)
-        self.attn = SpatialAttention()
-        # =================
-
         # --- DECODER (ReLU + bias=False) ---
+        # On garde ReLU ici car on veut nettoyer le bruit pour générer une image propre
 
         # Up 1 : 512 -> 256
         self.up1 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.ReflectionPad2d(1),
-            nn.Conv2d(512, 256, 3, 1, 0, bias=False),
+            nn.Conv2d(512, 256, kernel_size=3, stride=1, padding=1, padding_mode='reflect', bias=False),
             nn.InstanceNorm2d(256),
-            nn.ReLU(inplace=True) # ReLU classique pour nettoyer l'image
+            nn.ReLU(inplace=True)
         )
 
-        # Up 2 : 256 -> 128
+        # Up 2 : 512 (cat) -> 128
         self.up2 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.ReflectionPad2d(1),
-            # Input 512 car concat (256 + 256)
-            nn.Conv2d(512, 128, 3, 1, 0, bias=False),
+            # Input 512 car concatenation (256 venant du haut + 256 venant de x3)
+            nn.Conv2d(512, 128, kernel_size=3, stride=1, padding=1, padding_mode='reflect', bias=False),
             nn.InstanceNorm2d(128),
             nn.ReLU(inplace=True)
         )
 
-        # Up 3 : 128 -> 64
+        # Up 3 : 256 (cat) -> 64
         self.up3 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.ReflectionPad2d(1),
-            # Input 256 car concat (128 + 128)
-            nn.Conv2d(256, 64, 3, 1, 0, bias=False),
+            # Input 256 car concatenation (128 venant du haut + 128 venant de x2)
+            nn.Conv2d(256, 64, kernel_size=3, stride=1, padding=1, padding_mode='reflect', bias=False),
             nn.InstanceNorm2d(64),
             nn.ReLU(inplace=True)
         )
 
-        # Final
+        # Final : 128 (cat) -> 3 RGB
         self.final = nn.Sequential(
-            nn.ReflectionPad2d(3),
-            # Input 128 car concat (64 + 64)
-            # Pas de bias=False ici car pas de Norm derrière (c'est Tanh direct)
-            nn.Conv2d(128, 3, 7, 1, 0),
+            # Input 128 car concatenation (64 venant du haut + 64 venant de x1)
+            # Pas de bias=False ici car pas de Norm derrière
+            nn.Conv2d(128, 3, kernel_size=7, stride=1, padding=3, padding_mode='reflect'),
             nn.Tanh()
         )
 
     def forward(self, x):
         # Encoder
-        x1 = self.enc1(x)       # 64
-        x2 = self.down1(x1)     # 128
-        x3 = self.down2(x2)     # 256
-        x4 = self.down3(x3)     # 512 (32px)
+        x1 = self.enc1(x)  # 64
+        x2 = self.down1(x1)  # 128
+        x3 = self.down2(x2)  # 256
+        x4 = self.down3(x3)  # 512
 
         # Bottleneck
-        b = self.bottleneck(x4) # 512 (32px)
+        b = self.bottleneck(x4)  # 512
 
-        # Attention (Juste au bon endroit)
-        b = self.attn(b)
-
-        # Decoder
-        u1 = self.up1(b)        # 256 (64px)
+        # Decoder + Skip Connections
+        u1 = self.up1(b)  # 256
 
         u1_cat = torch.cat([u1, x3], dim=1)
-        u2 = self.up2(u1_cat)   # 128 (128px)
+        u2 = self.up2(u1_cat)  # 128
 
         u2_cat = torch.cat([u2, x2], dim=1)
-        u3 = self.up3(u2_cat)   # 64  (256px)
+        u3 = self.up3(u2_cat)  # 64
 
         u3_cat = torch.cat([u3, x1], dim=1)
-        output = self.final(u3_cat) # RGB
+        output = self.final(u3_cat)
 
         return output
 
@@ -384,8 +357,8 @@ def weights_init(m):
 class GenVanillaNN:
     def __init__(self, videoSke, loadFromFile=False, optSkeOrImage=1):
         # 128x128 est un bon compromis pour 8GB VRAM. 256x256 peut passer avec batch=8.
-        self.image_size = 256
-        image_size = 256
+        self.image_size = 128
+        image_size = 128
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         print(f"[GPU] Device: {self.device}")
 
@@ -469,7 +442,7 @@ class GenVanillaNN:
         # --- ATTENTION : Batch Size réduit pour VGG ---
         # VGG consomme beaucoup de VRAM. Sur RTX 4060, on met 16.
         # Si tu as une erreur "Out of Memory", descends à 8.
-        batch_size = 16
+        batch_size =64
 
         train_size = int(0.85 * len(self.dataset))
         val_size = len(self.dataset) - train_size
