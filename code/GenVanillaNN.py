@@ -1,23 +1,17 @@
 import numpy as np
 import cv2
 import os
-import pickle
-import sys
-import math
+
 
 from PIL import Image
-import matplotlib.pyplot as plt
-from torchvision.io import read_image
 from torchvision import models
 import torch.nn as nn
-import torch.nn.functional as F
 import torch
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
 from VideoSkeleton import VideoSkeleton
-from VideoReader import VideoReader
 from Skeleton import Skeleton
 
 # =============================================================================
@@ -217,22 +211,18 @@ class ResnetBlock(nn.Module):
     def __init__(self, dim):
         super(ResnetBlock, self).__init__()
         self.conv_block = nn.Sequential(
-            # Conv 1
+            # OPTIMISATION : padding_mode='reflect' intégré + bias=False
             nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect', bias=False),
             nn.InstanceNorm2d(dim),
-            nn.ReLU(True),
+            nn.ReLU(inplace=True),  # On garde ReLU dans le bottleneck (standard ResNet)
 
-            # Conv 2
             nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect', bias=False),
-            nn.InstanceNorm2d(dim),
-
-            # --- AJOUT SE BLOCK ICI ---
-            # Il recalibre les features avant de les réinjecter
-            SEBlock(dim)
+            nn.InstanceNorm2d(dim)
         )
 
     def forward(self, x):
         return x + self.conv_block(x)
+
 
 class GenNNSkeImToImage(nn.Module):
     def __init__(self):
@@ -245,11 +235,12 @@ class GenNNSkeImToImage(nn.Module):
             # Conv 7x7 avec reflection padding intégré
             nn.Conv2d(3, 64, kernel_size=7, stride=1, padding=3, padding_mode='reflect', bias=False),
             nn.InstanceNorm2d(64),
-            nn.LeakyReLU(0.2, inplace=True)  # inplace=True économise de la mémoire
+            nn.LeakyReLU(0.2, inplace=True)  # LeakyReLU est mieux pour l'encodeur
         )
 
         # Down 1 : 64 -> 128
         self.down1 = nn.Sequential(
+            # Stride 2 = Downsample
             nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, padding_mode='reflect', bias=False),
             nn.InstanceNorm2d(128),
             nn.LeakyReLU(0.2, inplace=True)
@@ -270,15 +261,16 @@ class GenNNSkeImToImage(nn.Module):
         )
 
         # --- BOTTLENECK ---
+        # 4 blocs pour rester léger
         self.bottleneck = nn.Sequential(
             ResnetBlock(512),
             ResnetBlock(512),
             ResnetBlock(512),
-            ResnetBlock(512)
+            ResnetBlock(512),
         )
 
         # --- DECODER (ReLU + bias=False) ---
-        # On garde ReLU ici car on veut nettoyer le bruit pour générer une image propre
+        # On garde ReLU ici pour nettoyer le signal avant la sortie
 
         # Up 1 : 512 -> 256
         self.up1 = nn.Sequential(
@@ -288,7 +280,7 @@ class GenNNSkeImToImage(nn.Module):
             nn.ReLU(inplace=True)
         )
 
-        # Up 2 : 512 (cat) -> 128
+        # Up 2 : 256 (cat) -> 128
         self.up2 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             # Input 512 car concatenation (256 venant du haut + 256 venant de x3)
@@ -297,7 +289,7 @@ class GenNNSkeImToImage(nn.Module):
             nn.ReLU(inplace=True)
         )
 
-        # Up 3 : 256 (cat) -> 64
+        # Up 3 : 128 (cat) -> 64
         self.up3 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             # Input 256 car concatenation (128 venant du haut + 128 venant de x2)
@@ -306,10 +298,10 @@ class GenNNSkeImToImage(nn.Module):
             nn.ReLU(inplace=True)
         )
 
-        # Final : 128 (cat) -> 3 RGB
+        # Final : 64 (cat) -> 3 RGB
         self.final = nn.Sequential(
             # Input 128 car concatenation (64 venant du haut + 64 venant de x1)
-            # Pas de bias=False ici car pas de Norm derrière
+            # Pas de bias=False ici car pas de Norm derrière (Tanh direct)
             nn.Conv2d(128, 3, kernel_size=7, stride=1, padding=3, padding_mode='reflect'),
             nn.Tanh()
         )
