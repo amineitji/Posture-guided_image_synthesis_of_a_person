@@ -32,14 +32,22 @@ class SelfAttention(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.size()
-        proj_query = self.query(x).view(B, -1, H * W).permute(0, 2, 1)
-        proj_key = self.key(x).view(B, -1, H * W)
+
+        # CORRECTION : Utilisation de .reshape() au lieu de .view()
+        # Cela permet de gérer le format channels_last
+        proj_query = self.query(x).reshape(B, -1, H * W).permute(0, 2, 1)
+        proj_key = self.key(x).reshape(B, -1, H * W)
+
         energy = torch.bmm(proj_query, proj_key)
         attention = torch.softmax(energy, dim=-1)
 
-        proj_value = self.value(x).view(B, C, H * W)
+        proj_value = self.value(x).reshape(B, C, H * W)
+
         out = torch.bmm(proj_value, attention.permute(0, 2, 1))
-        out = out.view(B, C, H, W)
+
+        # CORRECTION : Ici aussi, .reshape() pour remettre en forme
+        out = out.reshape(B, C, H, W)
+
         out = self.gamma * out + x
         return out
 
@@ -68,54 +76,64 @@ class Discriminator(nn.Module):
     def __init__(self):
         super().__init__()
 
+        # Définition du Dropout (0.3 = 30% des neurones désactivés)
+        # On le définit une fois et on l'appelle plusieurs fois
+        self.dropout = nn.Dropout(0.3)
+
         # Etage 1 : 128 -> 64
-        self.conv1 = nn.Conv2d(3, 64, 4, 2, 1)  # 64x64
+        self.conv1 = nn.Conv2d(3, 64, 4, 2, 1)
         self.lrelu = nn.LeakyReLU(0.2, inplace=True)
+        # PAS DE DROPOUT ICI (On garde l'input intact)
 
         # Etage 2 : 64 -> 32
-        self.conv2 = nn.Conv2d(64, 128, 4, 2, 1)  # 32x32
-        # InstanceNorm est plus rapide et standard pour les GANs image-to-image
+        self.conv2 = nn.Conv2d(64, 128, 4, 2, 1)
         self.gn2 = nn.InstanceNorm2d(128, affine=True)
+        # DROPOUT ICI : Oui
 
         # Etage 3 : 32 -> 16
-        self.conv3 = nn.Conv2d(128, 256, 4, 2, 1)  # 16x16
+        self.conv3 = nn.Conv2d(128, 256, 4, 2, 1)
         self.gn3 = nn.InstanceNorm2d(256, affine=True)
-        # OPTIMISATION : On supprime self.att3 (trop lourd ici)
-        # On garde juste SEBlock (coût négligeable)
         self.se3 = SEBlock(256)
+        # DROPOUT ICI : Oui
 
         # Etage 4 : 16 -> 8
-        self.conv4 = nn.Conv2d(256, 512, 4, 2, 1)  # 8x8 (Note le stride 2 pour descendre à 8px)
+        self.conv4 = nn.Conv2d(256, 512, 4, 2, 1)
         self.gn4 = nn.InstanceNorm2d(512, affine=True)
 
-        # On garde l'attention ICI seulement (sur du 8x8, c'est très rapide)
         self.att4 = SelfAttention(512)
         self.se4 = SEBlock(512)
+        # PAS DE DROPOUT ICI (On veut que l'Attention travaille sur des features stables)
 
         # Output : 8x8 -> 1
         self.out = nn.Conv2d(512, 1, 4, 1, 0)
 
-        print("[Discriminator] Version Light chargée (Attention uniquement en couche finale)")
+        print("[Discriminator] Version Light + Dropout (0.3) chargée")
 
     def forward(self, x):
         # x: 128x128
-        x = self.lrelu(self.conv1(x))  # -> 64x64
 
+        # Bloc 1
+        x = self.lrelu(self.conv1(x))
+
+        # Bloc 2 + Dropout
         x = self.conv2(x)
         x = self.gn2(x)
-        x = self.lrelu(x)  # -> 32x32
+        x = self.lrelu(x)
+        x = self.dropout(x)  # <--- AJOUT STRATÉGIQUE 1
 
+        # Bloc 3 + Dropout
         x = self.conv3(x)
         x = self.gn3(x)
         x = self.lrelu(x)
-        # Pas d'attention ici
-        x = self.se3(x)  # -> 16x16
+        x = self.se3(x)
+        x = self.dropout(x)  # <--- AJOUT STRATÉGIQUE 2
 
+        # Bloc 4 (Pas de dropout avant l'attention pour ne pas la casser)
         x = self.conv4(x)
         x = self.gn4(x)
         x = self.lrelu(x)
-        x = self.att4(x)  # OK car image petite (8x8)
-        x = self.se4(x)  # -> 8x8
+        x = self.att4(x)
+        x = self.se4(x)
 
         x = self.out(x)
         return x
@@ -223,6 +241,8 @@ class GenGAN():
         real = real.float()
         fake = fake.float()
         alpha = torch.rand(real.size(0), 1, 1, 1, device=self.device)
+
+        # L'interpolation garde le format channels_last si real/fake le sont
         interpol = (alpha * real + (1 - alpha) * fake).requires_grad_(True)
 
         d_interpol = self.netD(interpol)
@@ -238,25 +258,27 @@ class GenGAN():
             only_inputs=True,
         )[0]
 
-        gradients = gradients.view(gradients.size(0), -1)
+        # CORRECTION : .reshape() au lieu de .view() car gradients est en channels_last
+        gradients = gradients.reshape(gradients.size(0), -1)
+
         penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
         return penalty
 
     def train(self, n_epochs=200):
-        # Configuration Optimisée RTX 4060
-        batch_size = 16
+        # --- CONFIGURATION HYPER-PARAMÈTRES ---
+        batch_size = 64
         lr = 0.0001
-        n_critic = 3
-        lambda_gp = 10
+        n_critic = 4  # Le Discriminateur s'entraîne 3 fois plus que le Générateur
+        lambda_gp = 10  # Force de la pénalité de gradient (Standard WGAN-GP)
 
+        # --- DATALOADER ---
         dataloader = DataLoader(
-            self.dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=0,
-            pin_memory=True
+            self.dataset, batch_size=batch_size, shuffle=True,
+            num_workers=0, pin_memory=True
         )
+        total_batches = len(dataloader)
 
+        # --- OPTIMIZERS & LOSS ---
         optimizerG = optim.Adam(self.netG.parameters(), lr=lr, betas=(0.0, 0.9))
         optimizerD = optim.Adam(self.netD.parameters(), lr=lr, betas=(0.0, 0.9))
 
@@ -264,35 +286,49 @@ class GenGAN():
         criterion_VGG = VGGPerceptualLoss().to(self.device)
         scaler = torch.cuda.amp.GradScaler()
 
-        print("[TRAIN] Début WGAN-GP (RAM + Channels Last)")
+        print(f"[TRAIN] Démarrage WGAN-GP sur {self.device}...")
+        print(f"        Images: {len(self.dataset)} | Batchs: {total_batches}")
 
+        # ============================================================
+        # 1. CRÉATION DU "FIXED BATCH" (POUR SUIVRE LA PROGRESSION)
+        # ============================================================
+        print("[INIT] Sélection de 5 poses fixes pour le suivi...")
+        data_iter = iter(dataloader)
+        first_batch = next(data_iter)
+        # On garde les 5 premiers squelettes. .clone() protège les données.
+        fixed_ske = first_batch[0][:5].to(self.device, memory_format=torch.channels_last).clone()
+        # ============================================================
+
+        # --- BOUCLE D'ENTRAÎNEMENT ---
         for epoch in range(n_epochs):
             for i, (ske, real) in enumerate(dataloader):
 
-                # OPTIMISATION RTX : CHANNELS LAST
+                # Optimisation mémoire
                 ske = ske.to(self.device, non_blocking=True, memory_format=torch.channels_last)
                 real = real.to(self.device, non_blocking=True, memory_format=torch.channels_last)
 
-                # ====================================================
-                #            1. TRAIN DISCRIMINATOR
-                # ====================================================
+                # ---------------------------------------
+                #  ETAPE 1 : ENTRAÎNEMENT DU DISCRIMINATOR
+                # ---------------------------------------
                 optimizerD.zero_grad(set_to_none=True)
 
                 with torch.cuda.amp.autocast():
-                    fake = self.netG(ske).detach()
+                    fake = self.netG(ske).detach()  # .detach() pour ne pas toucher au Générateur
                     d_real = self.netD(real)
                     d_fake = self.netD(fake)
                     d_loss_adv = -torch.mean(d_real) + torch.mean(d_fake)
 
+                # Calcul de la pénalité de gradient (cœur du WGAN-GP)
                 gp = self.compute_gradient_penalty(real, fake) * lambda_gp
                 d_loss = d_loss_adv + gp
 
                 scaler.scale(d_loss).backward()
                 scaler.step(optimizerD)
 
-                # ====================================================
-                #            2. TRAIN GENERATOR
-                # ====================================================
+                # ---------------------------------------
+                #  ETAPE 2 : ENTRAÎNEMENT DU GENERATOR
+                # ---------------------------------------
+                # On entraîne le G seulement tous les 'n_critic' pas
                 if i % n_critic == 0:
                     optimizerG.zero_grad(set_to_none=True)
 
@@ -300,27 +336,50 @@ class GenGAN():
                         fake = self.netG(ske)
                         d_fake = self.netD(fake)
 
-                        g_loss_adv = -torch.mean(d_fake)
-                        g_loss_l1 = criterion_L1(fake, real)
-                        g_loss_vgg = criterion_VGG(fake, real)
+                        # Pertes composites
+                        g_loss_adv = -torch.mean(d_fake)  # Tromper le discriminateur
+                        g_loss_l1 = criterion_L1(fake, real)  # Ressembler aux pixels réels
+                        g_loss_vgg = criterion_VGG(fake, real)  # Avoir la même texture (Perceptuel)
 
-                        # Tes pondérations personnalisées
-                        g_loss = 0.3 * g_loss_adv + 6 * g_loss_l1 + 2.0 * g_loss_vgg
+                        # Poids des pertes : Adv=2, L1=10, VGG=0.3
+                        g_loss = 3 * g_loss_adv + 8.0 * g_loss_l1 + 0.3 * g_loss_vgg
 
                     scaler.scale(g_loss).backward()
                     scaler.step(optimizerG)
 
-                    if i % 50 == 0:
-                        print(f"\r[Ep {epoch}][Bt {i}] D:{d_loss.item():.4f} G:{g_loss.item():.4f}", end="")
+                    # --- Print Propre ---
+                    print(
+                        f"\r[Ep {epoch + 1}/{n_epochs}] [Bt {i + 1}/{total_batches}] "
+                        f"D: {d_loss.item():.4f} | G: {g_loss.item():.4f}",
+                        end=""
+                    )
 
                 scaler.update()
 
+            # Fin de l'époque : saut de ligne
+            print()
+
+            # ============================================================
+            # 3. SAUVEGARDE & VISUALISATION MULTI-POSE
+            # ============================================================
             if (epoch + 1) % 5 == 0:
+                # Sauvegarde des modèles
                 torch.save(self.netG.state_dict(), self.filenameG)
                 torch.save(self.netD.state_dict(), self.filenameD)
+
+                # Génération de l'image témoin
                 with torch.no_grad():
-                    img = self.generate(ske[0])
-                    cv2.imwrite(f"images_suivi/epoch_{epoch}.jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+                    images_list = []
+                    for k in range(len(fixed_ske)):
+                        # Générer chaque pose fixe
+                        img_gen = self.generate(fixed_ske[k])
+                        images_list.append(img_gen)
+
+                    # Concaténer horizontalement (H-Concat)
+                    if len(images_list) > 0:
+                        combined_image = cv2.hconcat(images_list)
+                        cv2.imwrite(f"images_suivi/epoch_{epoch}_multi.jpg", combined_image)
+                        print(f"   [SAVE] Checkpoint et Image multi-poses sauvés.")
 
     def generate(self, ske):
         self.netG.eval()
@@ -335,12 +394,18 @@ class GenGAN():
             else:
                 ske = ske.unsqueeze(0).to(self.device)
 
-            # Application Memory Format pour inference
             ske = ske.to(memory_format=torch.channels_last)
 
             with torch.cuda.amp.autocast():
                 fake = self.netG(ske)[0]
 
+            # Tensor (RGB) -> Numpy (RGB)
             img = fake.float().detach().cpu().permute(1, 2, 0).numpy()
             img = ((img * 0.5 + 0.5).clip(0, 1) * 255).astype("uint8")
-            return img
+
+            # CORRECTION COULEUR ICI
+            # On convertit explicitement RGB -> BGR pour OpenCV
+            # img[..., ::-1] inverse l'ordre des canaux (R,G,B -> B,G,R)
+            img_bgr = img[..., ::-1].copy()
+
+            return img_bgr
