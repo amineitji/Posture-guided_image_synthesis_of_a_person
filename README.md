@@ -58,7 +58,7 @@ Pour résoudre ces problèmes, nous avons combiné deux approches :
 2.  **Normalisation du Padding** :
     Nous avons modifié `VideoSkeleton` pour imposer un positionnement fixe. Le sujet est centré de manière cohérente, offrant au générateur des données stables.
 
-*Résultat final : une image centrée avec une marge de respiration adéquate.*
+*Résultat final : une image centrée avec une marge adéquate.*
 
 ![Padding Normalisé](Asset_readme/normalisation_padding.png)
 
@@ -174,11 +174,27 @@ Le discriminateur joue un rôle crucial dans la stabilité du WGAN-GP. Plutôt q
   - **SE Block (Squeeze-and-Excitation)** : Intégré dans les couches les plus profondes (**256 et 512 filtres**) pour recalibrer l'importance des canaux et se concentrer sur les caractéristiques les plus pertinentes.
   - **Self-Attention** : Placé dans la dernière couche de convolution (avant la sortie) pour capturer les dépendances spatiales à longue portée (cohérence globale de la silhouette), là où les convolutions classiques sont limitées à leur champ récepteur local.
 
-### 5.2 Stratégie d'Entraînement et Fonction de Coût (Loss)
+
+### 5.2 Architecture du Générateur : Le choix du U-Net (GenNNSkeImToImage)
+
+Pour le générateur du GAN, nous avons retenu l'architecture **`GenNNSkeImToImage`** (U-Net) prenant une image en entrée. 
+Cette décision découle d'un constat critique sur la nature des données d'entrée :
+
+* **Le problème du vecteur (Information trop maigre) :**
+Une entrée constituée de seulement 26 coordonnées s'est révélée insuffisante. Cette densité d'information est trop faible pour guider efficacement le réseau sur les subtilités d'une posture. 
+Le modèle est forcé de deviner la géométrie du corps à partir d'une liste abstraite de chiffres, ce qui produit souvent des mouvements flous ou incohérents.
+
+* **L'avantage de l'image (Cohérence Spatiale) :**
+  À l'inverse, fournir une image du squelette offre une structure spatiale explicite. 
+Grâce aux convolutions, le réseau capte immédiatement la cohérence spatiale du mouvement. 
+Il ne calcule plus des positions abstraites, il voit la pose tracée, ce qui lui permet d'apprendre des corrélations pixel à pixel et de garantir la fluidité des mouvements.
+
+
+### 5.3 Stratégie d'Entraînement et Fonction de Coût (Loss)
 
 La génération d'humains réalistes à partir de squelettes est un problème complexe qui nécessite d'équilibrer la structure (la pose doit être exacte) et la texture (vêtements, peau). Pour y parvenir, nous avons conçu une **Fonction de Coût Composite** et adopté les hyperparamètres du **WGAN-GP**.
 
-#### 5.3 La Fonction de Coût Composite (Generator Loss)
+### 5.4 La Fonction de Coût Composite (Generator Loss)
 Le générateur minimise une somme pondérée de trois pertes distinctes. La formule finale retenue est :
 
 > **Loss_G = 3.0 × Loss_Adv + 8.0 × Loss_L1 + 0.3 × Loss_VGG**
@@ -197,14 +213,14 @@ Nous avons empiriquement déterminé les poids suivants pour atteindre le point 
     * *Rôle* : Compare les caractéristiques extraites par un réseau VGG-16 pré-entraîné plutôt que les pixels bruts.
     * *Choix* : Ce poids de **0.3** permet d'améliorer la perception des textures et réduit l'effet de flou inhérent à la perte L1.
 
-#### 5.4 Stabilisation via WGAN-GP (Discriminator)
+### 5.5 Stabilisation via WGAN-GP (Discriminator)
 
 Pour contrer l'instabilité notoire des GANs, nous utilisons l'approche **Wasserstein GAN avec Gradient Penalty**.
 
 * **Critique (n_critic = 4)** : Le discriminateur est mis à jour **4 fois** pour chaque mise à jour du générateur. Cela garantit que le discriminateur fournit une estimation fiable de la distance de Wasserstein, guidant le générateur plus efficacement qu'un discriminateur "faible".
 * **Gradient Penalty (lambda_gp = 10)** : Le coefficient standard de pénalité de gradient, forçant le discriminateur à respecter la contrainte 1-Lipschitz (évite l'explosion des gradients).
 
-#### 5.5 Optimisation
+### 5.6 Optimisation
 
 * **Learning Rate** : `0.0001` (Standard pour WGAN, plus stable que le `0.0002` des DCGANs).
 * **Optimiseur Adam** : `Betas = (0.0, 0.9)`. Le paramètre Beta1 à **0.0** est crucial pour le WGAN-GP afin d'éviter les oscillations de momentum qui déstabiliseraient l'entraînement.
@@ -252,12 +268,38 @@ Un rééquilibrage (ex: descendre à 1 ou 2) pourrait corriger ce défaut tout e
 
 ## Lancer le code
 
-Les dépendances sont identiques à celles fournies au début du TP.
+### Installation et Configuration
+
+Les dépendances de ce projet sont identiques à celles fournies au début du TP.
+Cependant, si vous souhaitez tester le code exactement dans les mêmes conditions que lors du développement, veuillez utiliser le fichier `environment.yml` inclus à la racine du projet.
+
+#### 1. Création de l'environnement
+
+Assurez-vous d'avoir Conda installé, puis lancez la commande suivante à la racine du projet :
+
+```bash
+conda env create -f environment.yml
+```
+
+#### 2. Activation
+
+Activez l'environnement avec la commande suivante :
+
+```bash
+conda activate tp_ml
+```
+
+
+#### 3. Exécution du code
+
 Nous avons réalisé un script principal (`main.py`) à la racine du projet qui permet d'avoir une interface directement dans le terminal.
 
 Il suffit d'ouvrir un terminal à la racine du projet et d'exécuter la commande suivante :
 
-```python .\main.py```
+```bash
+python main.py
+```
+---
 
 ### Fonctionnement
 
