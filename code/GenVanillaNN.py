@@ -516,7 +516,7 @@ class GenVanillaNN:
                 transforms.ToTensor(),
                 transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
             ])
-            self.filename = "models/test123.pth"
+            self.filename = "models/modelsDanceGenVanillaFromSkeim.pth"
 
         # Transformations pour l'image cible (Data Augmentation)
         tgt_transform = transforms.Compose([
