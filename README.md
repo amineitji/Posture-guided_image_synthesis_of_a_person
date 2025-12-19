@@ -1,7 +1,9 @@
 
 # TP – Posture-guided Image Synthesis of a Person
 
-Ce projet explore la synthèse d'images guidée par la posture via une approche incrémentale : nous débutons par une baseline Nearest Neighbor, suivie de deux architectures neuronales "Vanilla" comparant des entrées distinctes (vecteur de coordonnées vs image de squelette). L'aboutissement est un GAN conditionnel où le squelette cible remplace le bruit aléatoire traditionnel pour générer des textures réalistes.
+Ce projet explore la synthèse d’images guidée par la posture à travers une approche progressive. 
+Après une méthode simple de correspondance par similarité, nous étudions deux architectures neuronales « vanilla » basées sur différentes représentations du squelette. 
+Le projet aboutit à un GAN conditionnel où le squelette cible remplace le bruit aléatoire afin de générer des images cohérentes et visuellement réalistes.
 
 ---
 
@@ -36,7 +38,7 @@ Au total, nous obtenons **4989 paires image / squelette** pour l’entraînement
 
 > Remarque : pour un sport rapide (ex. danse énergique, boxe), un échantillonnage plus dense serait nécessaire afin de mieux capturer la continuité temporelle des mouvements.
 
-### 2.3 Uniformisation du Padding et Marge de Sécurité
+### 2.2 Uniformisation du Padding et Marge de Sécurité
 
 Nous avons identifié deux problèmes majeurs dans le prétraitement initial :
 1.  **Instabilité du Padding** : Le padding changeait constamment de place (haut, bas, gauche) selon la posture, perturbant l'apprentissage.
