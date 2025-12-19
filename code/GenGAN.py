@@ -275,39 +275,54 @@ class GenGAN():
         self.dataset = RAMDataset(base_dataset)
 
     def compute_gradient_penalty(self, real, fake):
-        real = real.float()
-        fake = fake.float()
+        """
+        Calcul de la pénalité de gradient.
+        CORRECTION : On force l'exécution en Float32 pour éviter les NaN.
+        """
+        # On désactive l'autocast (AMP) ici, car calculer un gradient
+        # en float16 est trop instable.
+        with torch.amp.autocast(self.device.type, enabled=False):
+            # On s'assure que tout est en float32
+            real = real.float()
+            fake = fake.float()
 
-        # On s'assure que alpha est sur le bon device
-        alpha = torch.rand(real.size(0), 1, 1, 1, device=self.device)
+            batch_size, C, H, W = real.shape
+            alpha = torch.rand((batch_size, 1, 1, 1), device=self.device)
 
-        # L'interpolation garde le format channels_last si real/fake le sont
-        interpol = (alpha * real + (1 - alpha) * fake).requires_grad_(True)
+            # Interpolation entre l'image réelle et la fausse
+            interpolated_images = (alpha * real + (1 - alpha) * fake).requires_grad_(True)
 
-        d_interpol = self.netD(interpol)
+            # On passe l'image interpolée dans le Discriminateur
+            # Le discriminateur doit pouvoir accepter du float32 ici
+            d_interpolates = self.netD(interpolated_images)
 
-        fake_grad = torch.ones(d_interpol.shape, device=self.device, requires_grad=False)
+            fake = torch.ones(d_interpolates.shape, device=self.device, requires_grad=False)
 
-        gradients = torch.autograd.grad(
-            outputs=d_interpol,
-            inputs=interpol,
-            grad_outputs=fake_grad,
-            create_graph=True,
-            retain_graph=True,
-            only_inputs=True,
-        )[0]
+            # Calcul du gradient
+            gradients = torch.autograd.grad(
+                outputs=d_interpolates,
+                inputs=interpolated_images,
+                grad_outputs=fake,
+                create_graph=True,
+                retain_graph=True,
+                only_inputs=True,
+            )[0]
 
-        #  .reshape() au lieu de .view() car gradients est en channels_last
-        gradients = gradients.reshape(gradients.size(0), -1)
+            gradients = gradients.reshape(batch_size, -1)
 
-        penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
-        return penalty
+            # CORRECTION 2 : Ajout d'un epsilon (1e-12) dans la racine carrée (norm)
+            # Si le gradient est 0, la dérivée de sqrt(0) est infinie -> NaN
+            gradients_norm = torch.sqrt(torch.sum(gradients ** 2, dim=1) + 1e-12)
+
+            gradient_penalty = ((gradients_norm - 1) ** 2).mean()
+
+            return gradient_penalty
 
     def train(self, n_epochs=200):
         # --- CONFIGURATION HYPER-PARAMÈTRES ---
         batch_size = 64
         lr = 0.0001
-        n_critic = 4  # Le Discriminateur s'entraîne 4 fois plus que le Générateur
+        n_critic = 3  # Le Discriminateur s'entraîne 4 fois plus que le Générateur
         lambda_gp = 10  # Force de la pénalité de gradient (Standard WGAN-GP)
 
         # --- DATALOADER ---
@@ -366,19 +381,21 @@ class GenGAN():
                 # ---------------------------------------
                 #  ETAPE 1 : ENTRAÎNEMENT DU DISCRIMINATOR
                 # ---------------------------------------
+
+
                 optimizerD.zero_grad(set_to_none=True)
 
                 with amp_context:
-                    fake = self.netG(ske).detach()  # .detach() pour ne pas toucher au Générateur
+                    fake = self.netG(ske).detach()
                     d_real = self.netD(real)
                     d_fake = self.netD(fake)
                     d_loss_adv = -torch.mean(d_real) + torch.mean(d_fake)
 
-                    # Calcul de la pénalité de gradient (cœur du WGAN-GP)
-                    # GP est calculé hors autocast généralement ou géré par autograd
-                    # Ici on reste simple, si ça plante sur CPU on peut désactiver le GP ou le simplifier
-                    gp = self.compute_gradient_penalty(real, fake) * lambda_gp
-                    d_loss = d_loss_adv + gp
+                # La correction 1 gère le "enabled=False"
+                gp = self.compute_gradient_penalty(real, fake)
+
+                # On recombine la perte totale
+                d_loss = d_loss_adv + lambda_gp * gp
 
                 scaler.scale(d_loss).backward()
                 scaler.step(optimizerD)
@@ -400,7 +417,7 @@ class GenGAN():
                         g_loss_vgg = criterion_VGG(fake, real)  # Avoir la même texture (Perceptuel)
 
                         # Poids des pertes : Adv=3, L1=8, VGG=0.3
-                        g_loss = 3 * g_loss_adv + 8.0 * g_loss_l1 + 0.3 * g_loss_vgg
+                        g_loss = 1 * g_loss_adv + 8.0 * g_loss_l1 + 0.4 * g_loss_vgg
 
                     scaler.scale(g_loss).backward()
                     scaler.step(optimizerG)
