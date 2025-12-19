@@ -7,3 +7,5 @@
 /dernier model/test123.pth
 /test123.pth
 /data/
+__pycache__/
+*.pyc
