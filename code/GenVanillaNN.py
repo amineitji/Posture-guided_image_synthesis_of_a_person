@@ -351,16 +351,15 @@ class VGGPerceptualLoss(nn.Module):
 # =============================================================================
 
 class ResnetBlock(nn.Module):
-    # Le bloc standard des papiers CycleGAN / Pix2PixHD
     def __init__(self, dim):
         super(ResnetBlock, self).__init__()
         self.conv_block = nn.Sequential(
             nn.ReflectionPad2d(1),
-            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0),
+            nn.Conv2d(dim, dim, 3, 1, 0, bias=False), # Bias=False avant InstanceNorm
             nn.InstanceNorm2d(dim),
             nn.ReLU(True),
             nn.ReflectionPad2d(1),
-            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0),
+            nn.Conv2d(dim, dim, 3, 1, 0, bias=False),
             nn.InstanceNorm2d(dim)
         )
 
@@ -369,8 +368,8 @@ class ResnetBlock(nn.Module):
 
     def forward(self, x):
         out = self.conv_block(x)
-        out = self.se(out)
-        return x + out
+        out = self.se(out)  # Application du SE Block
+        return x + out      # Skip Connection
 
 class GenNNSkeImToImage(nn.Module):
     def __init__(self):
@@ -380,41 +379,39 @@ class GenNNSkeImToImage(nn.Module):
         # Le standard: Conv -> InstanceNorm -> ReLU
         self.enc1 = nn.Sequential(
             nn.ReflectionPad2d(3),
-            nn.Conv2d(3, 64, 7, 1, 0,),  # Grosse convolution au début pour capter l'ensemble
+            nn.Conv2d(3, 64, 7, 1, 0, bias=False),
             nn.InstanceNorm2d(64), nn.ReLU(True)
         )
 
         self.down1 = nn.Sequential(
-            nn.Conv2d(64, 128, 3, 2, 1),  # Stride 2 = Downsample
+            nn.Conv2d(64, 128, 3, 2, 1, bias=False),
             nn.InstanceNorm2d(128), nn.ReLU(True)
         )
         self.down2 = nn.Sequential(
-            nn.Conv2d(128, 256, 3, 2, 1),
+            nn.Conv2d(128, 256, 3, 2, 1, bias=False),
             nn.InstanceNorm2d(256), nn.ReLU(True)
         )
+        # On descend jusqu'à 512 filtres
         self.down3 = nn.Sequential(
-            nn.Conv2d(256, 512, 3, 2, 1),
+            nn.Conv2d(256, 512, 3, 2, 1, bias=False),
             nn.InstanceNorm2d(512), nn.ReLU(True)
         )
 
-        # --- BOTTLENECK (ResNet) ---
-        # Pix2PixHD recommande 6 à 9 blocs ici pour bien comprendre la structure
-        # C'est ici que la magie opère
+        # --- BOTTLENECK (ResNet + SE) ---
+        # 4 blocs résiduels à 512 canaux
         self.bottleneck = nn.Sequential(
             ResnetBlock(512),
             ResnetBlock(512),
             ResnetBlock(512),
-            ResnetBlock(512),  # On en met 4 pour rester léger sur ta 4060
+            ResnetBlock(512),
         )
 
-        # --- DECODER (Upsampling "Resize-Conv") ---
-        # C'est LA solution "selon les papiers" pour éviter la pixelisation
-
-        # Up 1 : 512 -> 256
+        # --- DECODER (Upsampling) ---
+        # Upsample + Conv pour éviter le checkerboard artifacts
         self.up1 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),  # Lisse
             nn.ReflectionPad2d(1),
-            nn.Conv2d(512, 256, 3, 1, 0),  # Raffine
+            nn.Conv2d(512, 256, 3, 1, 0, bias=False),
             nn.InstanceNorm2d(256),
             nn.ReLU(True)
         )
@@ -423,25 +420,25 @@ class GenNNSkeImToImage(nn.Module):
         self.up2 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             nn.ReflectionPad2d(1),
-            nn.Conv2d(256 + 256, 128, 3, 1, 0),  # +256 à cause du Skip Connection (cat)
+            nn.Conv2d(256 + 256, 128, 3, 1, 0, bias=False), # +256 pour le Skip-Co
             nn.InstanceNorm2d(128),
-            nn.ReLU(True,)
+            nn.ReLU(True)
         )
 
         # Up 3 : 128 -> 64
         self.up3 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             nn.ReflectionPad2d(1),
-            nn.Conv2d(128 + 128, 64, 3, 1, 0),
+            nn.Conv2d(128 + 128, 64, 3, 1, 0, bias=False), # +128 pour le Skip-Co
             nn.InstanceNorm2d(64),
-            nn.ReLU(True,)
+            nn.ReLU(True)
         )
 
-        # Final
+        # Final Layer
         self.final = nn.Sequential(
             nn.ReflectionPad2d(3),
-            nn.Conv2d(64 + 64, 3, 7, 1, 0),
-            nn.Tanh()
+            nn.Conv2d(64 + 64, 3, 7, 1, 0), # +64 pour le Skip-Co
+            nn.Tanh() # Sortie entre -1 et 1
         )
 
     def forward(self, x):
