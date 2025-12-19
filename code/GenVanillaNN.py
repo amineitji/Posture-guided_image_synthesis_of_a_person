@@ -356,11 +356,11 @@ class ResnetBlock(nn.Module):
         super(ResnetBlock, self).__init__()
         self.conv_block = nn.Sequential(
             nn.ReflectionPad2d(1),
-            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, bias=False),
+            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0),
             nn.InstanceNorm2d(dim),
             nn.ReLU(True),
             nn.ReflectionPad2d(1),
-            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, bias=False),
+            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0),
             nn.InstanceNorm2d(dim)
         )
 
@@ -372,9 +372,7 @@ class ResnetBlock(nn.Module):
         out = self.se(out)
         return x + out
 
-
 class GenNNSkeImToImage(nn.Module):
-    """Architecture U-Net : Encodeur -> Bottleneck -> Décodeur avec Skip Connections"""
     def __init__(self):
         super().__init__()
 
@@ -382,38 +380,41 @@ class GenNNSkeImToImage(nn.Module):
         # Le standard: Conv -> InstanceNorm -> ReLU
         self.enc1 = nn.Sequential(
             nn.ReflectionPad2d(3),
-            nn.Conv2d(3, 64, 7, 1, 0,bias=False),  # Grosse convolution au début pour capter l'ensemble
+            nn.Conv2d(3, 64, 7, 1, 0,),  # Grosse convolution au début pour capter l'ensemble
             nn.InstanceNorm2d(64), nn.ReLU(True)
         )
 
         self.down1 = nn.Sequential(
-            nn.Conv2d(64, 128, 3, 2, 1,bias=False),  # Stride 2 = Downsample
+            nn.Conv2d(64, 128, 3, 2, 1),  # Stride 2 = Downsample
             nn.InstanceNorm2d(128), nn.ReLU(True)
         )
         self.down2 = nn.Sequential(
-            nn.Conv2d(128, 256, 3, 2, 1,bias=False),
+            nn.Conv2d(128, 256, 3, 2, 1),
             nn.InstanceNorm2d(256), nn.ReLU(True)
         )
         self.down3 = nn.Sequential(
-            nn.Conv2d(256, 512, 3, 2, 1,bias=False),
+            nn.Conv2d(256, 512, 3, 2, 1),
             nn.InstanceNorm2d(512), nn.ReLU(True)
         )
 
         # --- BOTTLENECK (ResNet) ---
+        # Pix2PixHD recommande 6 à 9 blocs ici pour bien comprendre la structure
+        # C'est ici que la magie opère
         self.bottleneck = nn.Sequential(
             ResnetBlock(512),
             ResnetBlock(512),
             ResnetBlock(512),
-            ResnetBlock(512),  # On en met 4 pour rester léger sur 4060
+            ResnetBlock(512),  # On en met 4 pour rester léger sur ta 4060
         )
 
         # --- DECODER (Upsampling "Resize-Conv") ---
+        # C'est LA solution "selon les papiers" pour éviter la pixelisation
 
         # Up 1 : 512 -> 256
         self.up1 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),  # Lisse
             nn.ReflectionPad2d(1),
-            nn.Conv2d(512, 256, 3, 1, 0,bias=False),  # Raffine
+            nn.Conv2d(512, 256, 3, 1, 0),  # Raffine
             nn.InstanceNorm2d(256),
             nn.ReLU(True)
         )
@@ -422,7 +423,7 @@ class GenNNSkeImToImage(nn.Module):
         self.up2 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             nn.ReflectionPad2d(1),
-            nn.Conv2d(256 + 256, 128, 3, 1, 0,bias=False),  # +256 à cause du Skip Connection (cat)
+            nn.Conv2d(256 + 256, 128, 3, 1, 0),  # +256 à cause du Skip Connection (cat)
             nn.InstanceNorm2d(128),
             nn.ReLU(True,)
         )
@@ -431,7 +432,7 @@ class GenNNSkeImToImage(nn.Module):
         self.up3 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             nn.ReflectionPad2d(1),
-            nn.Conv2d(128 + 128, 64, 3, 1, 0,bias=False),
+            nn.Conv2d(128 + 128, 64, 3, 1, 0),
             nn.InstanceNorm2d(64),
             nn.ReLU(True,)
         )
@@ -518,7 +519,7 @@ class GenVanillaNN:
                 transforms.ToTensor(),
                 transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
             ])
-            self.filename = "models/DanceGenVanillaFromSkeim.pth"
+            self.filename = "models/test123.pth"
 
         # Transformations pour l'image cible (Data Augmentation)
         tgt_transform = transforms.Compose([
