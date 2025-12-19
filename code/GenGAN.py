@@ -320,6 +320,11 @@ class GenGAN():
 
     def train(self, n_epochs=200):
         # --- CONFIGURATION HYPER-PARAMÈTRES ---
+
+        if not os.path.exists("images_suivi"):
+            os.makedirs("images_suivi")
+            print("[INIT] Dossier 'images_suivi' créé.")
+
         batch_size = 64
         lr = 0.0001
         n_critic = 3  # Le Discriminateur s'entraîne 4 fois plus que le Générateur
