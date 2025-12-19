@@ -178,8 +178,6 @@ Le discriminateur joue un rôle crucial dans la stabilité du WGAN-GP. Plutôt q
 
 La génération d'humains réalistes à partir de squelettes est un problème complexe qui nécessite d'équilibrer la structure (la pose doit être exacte) et la texture (vêtements, peau). Pour y parvenir, nous avons conçu une **Fonction de Coût Composite** et adopté les hyperparamètres du **WGAN-GP**.
 
-La génération d'humains réalistes à partir de squelettes est un problème complexe qui nécessite d'équilibrer la structure (la pose doit être exacte) et la texture (vêtements, peau). Pour y parvenir, nous avons conçu une **Fonction de Coût Composite** et adopté les hyperparamètres du **WGAN-GP**.
-
 #### 5.3 La Fonction de Coût Composite (Generator Loss)
 Le générateur minimise une somme pondérée de trois pertes distinctes. La formule finale retenue est :
 
