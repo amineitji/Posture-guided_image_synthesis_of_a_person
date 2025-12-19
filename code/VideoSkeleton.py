@@ -10,7 +10,7 @@ from VideoReader import VideoReader
 from Skeleton import Skeleton
 
 def filename_change_ext(filename_full, nouvelle_extension):
-    # --- MODIF: Force la sauvegarde dans data/processed ---
+    # --- Force la sauvegarde dans data/processed ---
     base = os.path.basename(filename_full)
     name_no_ext = os.path.splitext(base)[0]
     
@@ -76,9 +76,9 @@ class VideoSkeleton:
     """
     def __init__(self, filename, forceCompute=False, modFrame=3, newVideoWidth=256, cropRatio=1.3, isCrop=True):
         self.mod_frame = modFrame
-        self.cropRatio = cropRatio  # <--- AJOUTER CETTE LIGNE
-        self.new_video_width = newVideoWidth  # <--- AJOUTER CETTE LIGNE
-        # --- MODIF: Recherche automatique dans data/raw ---
+        self.cropRatio = cropRatio  #
+        self.new_video_width = newVideoWidth
+        # --- Recherche automatique dans data/raw ---
         if not os.path.exists(filename):
             raw_path = os.path.join("data/raw", os.path.basename(filename))
             if os.path.exists(raw_path):
@@ -178,19 +178,16 @@ class VideoSkeleton:
 
     def cropAndSke(self, image, ske, isCrop=True):
         # 1. On garde l'image ORIGINALE (Haute qualité) pour les calculs
-        # On ne fait PAS de cv2.resize(image) ici !
         img_height, img_width = image.shape[:2]
 
-        # Note : Pour que ske.fromImage marche, il faut s'assurer que le squelette
+        # Pour que ske.fromImage marche, il faut s'assurer que le squelette
         # a été détecté sur cette taille d'image, ou mis à l'échelle.
-        # (Supposons ici que ske correspond à l'image fournie en entrée)
 
         if ske.fromImage(image):
             if isCrop:
-                # On calcule la taille du crop basée sur un ratio de la hauteur originale
-                # Ex: Si la vidéo fait 1080p, crop_size sera ~1000px
+
                 dim_ref = min(img_width, img_height)
-                crop_size = int(dim_ref * self.cropRatio)  # Il faut que cropRatio soit dispo ici
+                crop_size = int(dim_ref * self.cropRatio)
 
                 xm, ym, xM, yM = ske.boundingBox()
                 center_x = (xm + xM) * img_width / 2
@@ -206,9 +203,8 @@ class VideoSkeleton:
                 # Découpe Haute Résolution
                 image_crop = image[tl_y: tl_y + crop_size, tl_x: tl_x + crop_size]
 
-                # --- C'EST ICI QU'ON UTILISE newVideoWidth ---
+                # --- newVideoWidth ---
                 # On redimensionne le CROP final vers la taille voulue (ex: 128x128)
-                # On force un carré.
                 image_final = cv2.resize(image_crop, (self.new_video_width, self.new_video_width))
 
                 # Mise à jour du squelette (Normalisation classique)
@@ -272,8 +268,7 @@ if __name__ == '__main__':
     print("-" * 30)
     print("DEMARRAGE DU TEST VISUEL")
 
-    # 2. Chargement (forceCompute=False pour utiliser ce qui est déjà calculé)
-    # Assure-toi que cropRatio est bien à 2.0 ici
+    # 2. Chargement
     s = VideoSkeleton(filename, forceCompute=False, newVideoWidth=256, cropRatio=1.3)
 
     # 3. Vérification du nombre de squelettes
@@ -281,7 +276,7 @@ if __name__ == '__main__':
     print(f"Nombre de squelettes trouvés : {count}")
 
     if count > 0:
-        # On prend le premier squelette (index 0) pour être sûr qu'il existe
+        # On prend le premier squelette (index 0)
         idx = 0
 
         # Création image noire (H, W, 3)
@@ -297,14 +292,10 @@ if __name__ == '__main__':
             cv2.imshow('Verification Squelette', image_noire)
 
             print(">>> FENETRE OUVERTE. Appuie sur une touche du clavier pour quitter. <<<")
-            # waitKey(0) BLOQUE le programme indéfiniment jusqu'à une touche
             cv2.waitKey(0)
             cv2.destroyAllWindows()
 
         except Exception as e:
             print(f"Erreur pendant le dessin : {e}")
-            print("Vérifie que tu as bien corrigé la classe VideoSkeleton (numpy object) !")
     else:
         print("ERREUR : Aucun squelette dans la liste.")
-        print("1. Vérifie le chemin de la vidéo.")
-        print("2. Essaie de mettre forceCompute=True pour recalculer.")

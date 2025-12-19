@@ -1,7 +1,7 @@
 import numpy as np
 import cv2
 import os
-
+import contextlib  # Nécessaire pour gérer le contexte CPU/GPU proprement
 
 from PIL import Image
 from torchvision import models
@@ -15,19 +15,35 @@ from VideoSkeleton import VideoSkeleton
 from Skeleton import Skeleton
 
 # =============================================================================
-# OPTIMISATIONS RTX 4060 (Ada Lovelace)
+#  PARTIE 1 : OPTIMISATIONS & CONFIGURATION (CPU / GPU)
 # =============================================================================
+
 torch.set_default_dtype(torch.float32)
-
-# 1. Active le TensorFloat-32 (TF32) : Indispensable sur RTX 4000
-# 'high' = très rapide, perte précision minime. 'medium' = encore plus rapide.
-torch.set_float32_matmul_precision('high')
-
-# 2. Benchmark CuDNN pour trouver l'algo de convolution le plus rapide
-torch.backends.cudnn.benchmark = True
-
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
+# On détecte si le GPU est dispo AVANT d'appliquer les optimisations
+use_cuda = torch.cuda.is_available()
+
+if use_cuda:
+    # Optimisations spécifiques pour les cartes RTX (TensorFloat-32)
+    torch.set_float32_matmul_precision('high')
+    torch.backends.cudnn.benchmark = True
+    print(f"[INIT] Mode GPU activé (Optimisations RTX)")
+else:
+    print(f"[INIT] Mode CPU activé (Optimisations GPU désactivées)")
+
+
+# --- CLASSE UTILITAIRE POUR LE CPU ---
+class CpuScaler:
+    """Classe 'Fake' qui imite le GradScaler pour le CPU (ne fait rien)"""
+    def scale(self, loss): return loss
+    def step(self, optimizer): optimizer.step()
+    def update(self): pass
+
+
+# =============================================================================
+#  PARTIE 2 : DATASET & TRANSFORMATION DES DONNÉES
+# =============================================================================
 
 class SkeToImageTransform:
     def __init__(self, image_size):
@@ -54,7 +70,7 @@ class VideoSkeletonDataset(Dataset):
         self.target_transform = target_transform
         self.ske_reduced = ske_reduced
 
-        print(f"[DATASET] Chargement des données en RAM pour accélérer l'entraînement...")
+        print(f"[DATASET] Chargement des données en RAM...")
         self.cached_images = []
         self.cached_skeletons = []
 
@@ -62,36 +78,29 @@ class VideoSkeletonDataset(Dataset):
         # On lit TOUTES les images maintenant. Ça prendra quelques secondes au début,
         # mais ensuite l'entraînement sera ultra-fluide.
         for idx in range(self.videoSke.skeCount()):
-            # 1. Charger l'image
-            # On convertit tout de suite en RGB pour éviter de le refaire 1000 fois
             img = Image.open(self.videoSke.imagePath(idx)).convert('RGB')
             self.cached_images.append(img)
 
-            # 2. Préparer le squelette
-            # On fait le calcul numpy -> torch tout de suite aussi
             ske = self.videoSke.ske[idx]
             ske_tensor = self.preprocessSkeleton(ske)
             self.cached_skeletons.append(ske_tensor)
 
-        print(f"[DATASET] {len(self.cached_images)} images chargées en mémoire RAM. Prêt !")
+        print(f"[DATASET] {len(self.cached_images)} images chargées en mémoire RAM.")
 
     def __len__(self):
         return len(self.cached_images)
 
     def __getitem__(self, idx):
-        # ACCÈS INSTANTANÉ (Plus de lecture disque)
         image = self.cached_images[idx]
         ske = self.cached_skeletons[idx]
 
-        # On applique les transformations (Data Augmentation) à la volée
-        # C'est important de le faire ici pour que le "Random" fonctionne à chaque epoch
         if self.target_transform:
             image = self.target_transform(image)
 
         return ske, image
 
     def preprocessSkeleton(self, ske):
-        # Cette fonction ne change pas, elle est juste appelée dans le __init__ maintenant
+
         if self.source_transform:
             ske = self.source_transform(ske)
         else:
@@ -115,7 +124,13 @@ class VideoSkeletonDataset(Dataset):
         numpy_image = (numpy_image * 0.5 + 0.5) * 255
         return numpy_image.clip(0, 255).astype(np.uint8)
 
+
+# =============================================================================
+#  PARTIE 3 : BLOCS DE CONSTRUCTION (ATTENTION & RESNET)
+# =============================================================================
+
 class SEBlock(nn.Module):
+    """Bloc Squeeze-and-Excitation : Améliore l'importance des canaux"""
     def __init__(self, channel, reduction=16):
         super(SEBlock, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
@@ -132,14 +147,9 @@ class SEBlock(nn.Module):
         y = self.fc(y).view(b, c, 1, 1)
         return x * y.expand_as(x)
 
-# ============================================================
-#           GENERATEUR VECTORIEL (26 -> 128x128)
-# ============================================================
-class SelfAttention(nn.Module):
-    """
-    Mécanisme d'attention pour relier des pixels distants.
-    """
 
+class SelfAttention(nn.Module):
+    """Attention Spatiale : Permet au réseau de voir l'ensemble de l'image"""
     def __init__(self, in_dim):
         super(SelfAttention, self).__init__()
         self.query = nn.Conv2d(in_dim, in_dim // 8, kernel_size=1)
@@ -149,37 +159,24 @@ class SelfAttention(nn.Module):
 
     def forward(self, x):
         batch_size, C, width, height = x.size()
-
         proj_query = self.query(x).view(batch_size, -1, width * height).permute(0, 2, 1)
         proj_key = self.key(x).view(batch_size, -1, width * height)
         energy = torch.bmm(proj_query, proj_key)
         attention = F.softmax(energy, dim=-1)
-
         proj_value = self.value(x).view(batch_size, -1, width * height)
         out = torch.bmm(proj_value, attention.permute(0, 2, 1))
         out = out.view(batch_size, C, width, height)
-
         return self.gamma * out + x
 
 
-# ============================================================
-# 2. MODULE RESIDUAL BLOCK (Optimisé Conv2d)
-# ============================================================
 class ResidualBlock(nn.Module):
-    """
-    Bloc résiduel classique mais avec 'ReflectionPad' intégré
-    via padding_mode='reflect' pour une meilleure gestion des bords.
-    """
-
+    """Bloc Résiduel simple pour le modèle Vectoriel"""
     def __init__(self, channels):
         super(ResidualBlock, self).__init__()
         self.block = nn.Sequential(
-            # Conv 1
             nn.Conv2d(channels, channels, kernel_size=3, padding=1, padding_mode='reflect'),
             nn.InstanceNorm2d(channels),
             nn.LeakyReLU(0.2, inplace=True),
-
-            # Conv 2
             nn.Conv2d(channels, channels, kernel_size=3, padding=1, padding_mode='reflect'),
             nn.InstanceNorm2d(channels)
         )
@@ -188,15 +185,14 @@ class ResidualBlock(nn.Module):
         return x + self.block(x)
 
 
-# ============================================================
-# 3. GÉNÉRATEUR FINAL (SKELETON -> IMAGE)
-# ============================================================
+# =============================================================================
+#  PARTIE 4 : GÉNÉRATEUR SIMPLE (VECTEUR -> IMAGE)
+# =============================================================================
+
 class GenNNSke26ToImage(nn.Module):
+    """Prend un vecteur de 26 coordonnées et génère une image"""
     def __init__(self, latent_dim=26):
         super(GenNNSke26ToImage, self).__init__()
-
-        # --- BLOC INITIAL (Latent -> 4x4) ---
-        # Projection linéaire + Reshape (Plus stable que ConvTranspose sur vecteur 1D)
         self.fc_init = nn.Linear(latent_dim, 512 * 4 * 4)
         self.bn_init = nn.InstanceNorm2d(512)
 
@@ -208,7 +204,7 @@ class GenNNSke26ToImage(nn.Module):
             nn.Conv2d(512, 256, 3, 1, 1, padding_mode='reflect'),
             nn.InstanceNorm2d(256),
             nn.LeakyReLU(0.2, inplace=True),
-            SEBlock(256)  # Utilisation de ta classe existante
+            SEBlock(256)
         )
 
         # 8x8 -> 16x16
@@ -221,7 +217,7 @@ class GenNNSke26ToImage(nn.Module):
         )
 
         # --- ATTENTION (Placée à 16x16) ---
-        # C'est le meilleur endroit : assez de résolution pour voir la forme,
+        # assez de résolution pour voir la forme,
         # mais assez petit pour ne pas exploser la mémoire.
         self.attention = SelfAttention(128)
 
@@ -264,7 +260,7 @@ class GenNNSke26ToImage(nn.Module):
         )
 
     def forward(self, x):
-        # 1. Input Handling : On s'assure que c'est plat (Batch, 26)
+        # 1. (Batch, 26)
         x = x.view(x.size(0), -1)
 
         # 2. Projection Latente
@@ -292,7 +288,12 @@ class GenNNSke26ToImage(nn.Module):
         return x
 
 
+# =============================================================================
+#  PARTIE 5 : FONCTION DE PERTE (LOSS)
+# =============================================================================
+
 class VGGPerceptualLoss(nn.Module):
+    """Calcule la différence de 'style' et de 'texture' en utilisant un VGG pré-entraîné"""
     def __init__(self, resize=True):
         super(VGGPerceptualLoss, self).__init__()
         # On utilise VGG16 (léger et efficace pour la texture)
@@ -311,10 +312,9 @@ class VGGPerceptualLoss(nn.Module):
         for param in self.parameters():
             param.requires_grad = False
 
-        self.eval() # Important : On met VGG en mode évaluation (désactive dropout interne)
+        self.eval() # On met VGG en mode évaluation (désactive dropout interne)
 
         # OPTIMISATION : On utilise register_buffer
-        # Comme ça, mean et std vont sur le GPU tout seuls quand tu fais model.to('cuda')
         self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
@@ -324,7 +324,7 @@ class VGGPerceptualLoss(nn.Module):
             input = input.repeat(1, 3, 1, 1)
             target = target.repeat(1, 3, 1, 1)
 
-        # 2. CORRECTION CRUCIALE : On passe de [-1, 1] à [0, 1]
+        # 2. On passe de [-1, 1] à [0, 1]
         # Car Tanh sort du [-1, 1], mais la normalisation ImageNet veut du [0, 1]
         input = (input + 1) / 2
         target = (target + 1) / 2
@@ -346,12 +346,9 @@ class VGGPerceptualLoss(nn.Module):
         return loss
 
 
-
-
-
-# ============================================================
-#                     GENERATEUR PRINCIPAL
-# ============================================================
+# =============================================================================
+#  PARTIE 6 : GÉNÉRATEUR AVANCÉ (U-NET / PIX2PIX)
+# =============================================================================
 
 class ResnetBlock(nn.Module):
     # Le bloc standard des papiers CycleGAN / Pix2PixHD
@@ -359,14 +356,11 @@ class ResnetBlock(nn.Module):
         super(ResnetBlock, self).__init__()
         self.conv_block = nn.Sequential(
             nn.ReflectionPad2d(1),
-            # CORRECTION : on spécifie stride=1 et padding=0 explicitement
-            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0,bias=False),
+            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, bias=False),
             nn.InstanceNorm2d(dim),
             nn.ReLU(True),
-
             nn.ReflectionPad2d(1),
-            # CORRECTION ICI AUSSI
-            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0,bias=False),
+            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, bias=False),
             nn.InstanceNorm2d(dim)
         )
 
@@ -374,12 +368,13 @@ class ResnetBlock(nn.Module):
         self.se = SEBlock(dim)
 
     def forward(self, x):
-        # On applique le SEBlock sur le chemin résiduel avant l'addition
         out = self.conv_block(x)
         out = self.se(out)
         return x + out
 
+
 class GenNNSkeImToImage(nn.Module):
+    """Architecture U-Net : Encodeur -> Bottleneck -> Décodeur avec Skip Connections"""
     def __init__(self):
         super().__init__()
 
@@ -405,17 +400,14 @@ class GenNNSkeImToImage(nn.Module):
         )
 
         # --- BOTTLENECK (ResNet) ---
-        # Pix2PixHD recommande 6 à 9 blocs ici pour bien comprendre la structure
-        # C'est ici que la magie opère
         self.bottleneck = nn.Sequential(
             ResnetBlock(512),
             ResnetBlock(512),
             ResnetBlock(512),
-            ResnetBlock(512),  # On en met 4 pour rester léger sur ta 4060
+            ResnetBlock(512),  # On en met 4 pour rester léger sur 4060
         )
 
         # --- DECODER (Upsampling "Resize-Conv") ---
-        # C'est LA solution "selon les papiers" pour éviter la pixelisation
 
         # Up 1 : 512 -> 256
         self.up1 = nn.Sequential(
@@ -462,7 +454,6 @@ class GenNNSkeImToImage(nn.Module):
         b = self.bottleneck(x4)  # 512
 
         # Decoder + Skip Connections (U-Net)
-        # Attention aux concaténations : on recolle les morceaux de l'encodeur
 
         # Pas de skip sur le niveau le plus profond (classique Pix2Pix)
         u1 = self.up1(b)  # 256
@@ -478,76 +469,71 @@ class GenNNSkeImToImage(nn.Module):
 
         return output
 
-def weights_init(m):
-    classname = m.__class__.__name__
 
-    # 1. Convolutions ET Linear (pour les SEBlocks !)
-    # On vérifie si c'est une Conv ou une Linear
+def weights_init(m):
+    """Fonction d'initialisation des poids (Normal distribution)"""
+    classname = m.__class__.__name__
     if classname.find('Conv') != -1 or classname.find('Linear') != -1:
         nn.init.normal_(m.weight.data, 0.0, 0.02)
-
-        # Gestion propre du biais (certaines couches n'en ont pas si bias=False)
         if hasattr(m, 'bias') and m.bias is not None:
             nn.init.constant_(m.bias.data, 0.0)
-
-    # 2. Normalisations (BatchNorm, InstanceNorm, GroupNorm)
-    # On ajoute GroupNorm au cas où tu voudrais tester plus tard
     elif classname.find('BatchNorm') != -1 or classname.find('InstanceNorm') != -1 or classname.find('GroupNorm') != -1:
-        # On ne touche que si affine=True (c'est-à-dire s'il y a des poids)
         if hasattr(m, 'weight') and m.weight is not None:
             nn.init.normal_(m.weight.data, 1.0, 0.02)
         if hasattr(m, 'bias') and m.bias is not None:
             nn.init.constant_(m.bias.data, 0.0)
 
+
+# =============================================================================
+#  PARTIE 7 : CLASSE PRINCIPALE (GESTION DE L'ENTRAINEMENT)
+# =============================================================================
+
 class GenVanillaNN:
     def __init__(self, videoSke, loadFromFile=False, optSkeOrImage=1):
-        # 128x128 est un bon compromis pour 8GB VRAM. 256x256 peut passer avec batch=8.
         self.image_size = 128
         image_size = 128
+
+        # --- CONFIGURATION DEVICE (GPU/CPU) ---
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        print(f"[GPU] Device: {self.device}")
+        print(f"[DEVICE] Utilisation de : {self.device}")
 
         self.optSkeOrImage = optSkeOrImage
 
+        # Choix du modèle selon l'option
         if optSkeOrImage == 1:
             self.netG = GenNNSke26ToImage().to(self.device)
             src_transform = None
             self.filename = "models/DanceGenVanillaFromSke26.pth"
         else:
             self.netG = GenNNSkeImToImage()
-            # 3. OPTIMISATION : Channels Last Memory Format
-            # Les RTX 4000 sont beaucoup plus rapides si la mémoire est agencée en (N, H, W, C)
-            self.netG = self.netG.to(memory_format=torch.channels_last)
+            # Optimisation "Channels Last" uniquement si GPU
+            if self.device.type == 'cuda':
+                self.netG = self.netG.to(memory_format=torch.channels_last)
+
             self.netG = self.netG.to(self.device)
             self.netG.apply(weights_init)
+
             src_transform = transforms.Compose([
                 SkeToImageTransform(image_size),
                 transforms.ToTensor(),
                 transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
             ])
-            self.filename = "models/test123.pth"
+            self.filename = "models/DanceGenVanillaFromSkeim.pth"
 
+        # Transformations pour l'image cible (Data Augmentation)
         tgt_transform = transforms.Compose([
-            # 1. Jitter : On change un peu la lumière/contraste (sur l'image PIL)
             transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1),
-
-            # 2. Conversion en Tenseur
             transforms.ToTensor(),
-
-            # 3. Normalisation : On passe les pixels entre -1 et 1
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-
-            # 4. ANTI-PAR-CŒUR : Random Erasing (Doit être APRES ToTensor)
-            # p=0.5             : 1 chance sur 2 d'effacer une zone
-            # scale=(0.02, 0.1) : Le trou fait entre 2% et 10% de l'image
-            # value=0           : On remplit avec du gris moyen (0 est le milieu car on est entre -1 et 1)
             transforms.RandomErasing(p=0.5, scale=(0.02, 0.1), ratio=(0.3, 3.3), value=0),
         ])
 
+        # Création du Dataset
         self.dataset = VideoSkeletonDataset(
             videoSke, ske_reduced=True, target_transform=tgt_transform, source_transform=src_transform
         )
 
+        # Chargement d'un modèle existant
         if loadFromFile and os.path.isfile(self.filename):
             print("GenVanillaNN: Load=", self.filename)
             try:
@@ -558,97 +544,104 @@ class GenVanillaNN:
             except Exception as e:
                 print(f"[✗] Erreur chargement: {e}")
 
-
     def generate(self, ske):
+        """Fonction pour générer une image à partir d'un squelette"""
         self.netG.eval()
         with torch.no_grad():
             if self.optSkeOrImage == 1:
                 ske_input = torch.from_numpy(ske.toarray(reduced=True).flatten()).float()
                 ske_input = ske_input.unsqueeze(0).to(self.device)
             else:
-                # CORRECTION : On utilise self.image_size (ex: 128) et pas 256 en dur !
                 transform = transforms.Compose([
                     SkeToImageTransform(self.image_size),
                     transforms.ToTensor(),
                     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
                 ])
 
-                # Le passage en .unsqueeze(0) ajoute la dimension du Batch (1, 3, 128, 128)
-                ske_input = transform(ske).unsqueeze(0).to(self.device, memory_format=torch.channels_last)
+                ske_input = transform(ske).unsqueeze(0).to(self.device)
+                if self.device.type == 'cuda':
+                    ske_input = ske_input.to(memory_format=torch.channels_last)
 
-            with torch.amp.autocast("cuda"):
+            # Gestion du mode mixte (CPU/GPU)
+            ctx = torch.amp.autocast("cuda") if self.device.type == 'cuda' else contextlib.nullcontext()
+
+            with ctx:
                 output = self.netG(ske_input)
 
-            # Récupération en RGB
             rgb_image = self.dataset.tensor2image(output[0])
-
-            # Conversion RGB -> BGR pour OpenCV
             bgr_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
 
             return bgr_image
 
-    def train(self, n_epochs=200):  # Je conseille 200 car VGG affine doucement
-        print(f"[TRAIN] Début de l'entraînement (L1 + VGG Perceptual) sur {self.device}")
+    def train(self, n_epochs=200):
+        """Boucle principale d'entraînement"""
+        print(f"[TRAIN] Début de l'entraînement sur {self.device}")
 
-        # --- CONFIGURATION ---
-        batch_size = 64  #
+        # Configuration des Dataloaders
+        batch_size = 64
         train_size = int(0.85 * len(self.dataset))
         val_size = len(self.dataset) - train_size
         train_dataset, val_dataset = torch.utils.data.random_split(self.dataset, [train_size, val_size])
 
-        num_workers = 0
+        use_pin = (self.device.type == 'cuda')
+        train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True, num_workers=0,
+                                  pin_memory=use_pin)
+        val_loader = DataLoader(dataset=val_dataset, batch_size=batch_size, shuffle=False, num_workers=0,
+                                pin_memory=use_pin)
 
-        train_loader = DataLoader(
-            dataset=train_dataset, batch_size=batch_size, shuffle=True,
-            num_workers=num_workers, pin_memory=True
-        )
-        val_loader = DataLoader(
-            dataset=val_dataset, batch_size=batch_size, shuffle=False,
-            num_workers=num_workers, pin_memory=True
-        )
-
-        # --- VISU: On récupère un squelette fixe UNE SEULE FOIS avant la boucle ---
+        # Image témoin pour le suivi
         fixed_sample_iter = iter(val_loader)
         fixed_sample = next(fixed_sample_iter)
-        fixed_ske = fixed_sample[0][0:1].to(self.device, non_blocking=True, memory_format=torch.channels_last)
-        print("[TRAIN] Image témoin chargée.")
+        fixed_ske = fixed_sample[0][0:1].to(self.device, non_blocking=True)
+        if self.device.type == 'cuda':
+            fixed_ske = fixed_ske.to(memory_format=torch.channels_last)
 
         if not os.path.exists("images_suivi"):
             os.makedirs("images_suivi")
 
-        # --- INITIALISATION DES LOSS ---
+        # Configuration Loss & Optimizer
         criterion_l1 = nn.L1Loss()
         print("[TRAIN] Chargement du VGG...")
         criterion_vgg = VGGPerceptualLoss().to(self.device)
 
         optimizer = optim.Adam(self.netG.parameters(), lr=0.0002, betas=(0.5, 0.999))
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
-        scaler = torch.cuda.amp.GradScaler()
+
+        # Scaler pour le Mixed Precision (GPU uniquement)
+        if self.device.type == 'cuda':
+            scaler = torch.cuda.amp.GradScaler()
+            amp_context = torch.amp.autocast("cuda")
+        else:
+            scaler = CpuScaler()
+            amp_context = contextlib.nullcontext()
 
         best_val_loss = float("inf")
 
+        # --- BOUCLE DES EPOCHS ---
         for epoch in range(n_epochs):
             self.netG.train()
             running_loss = 0.0
             batch_count = 0
 
             for i, (inputs, targets) in enumerate(train_loader):
-                inputs = inputs.to(self.device, non_blocking=True, memory_format=torch.channels_last)
-                targets = targets.to(self.device, non_blocking=True, memory_format=torch.channels_last)
+                inputs = inputs.to(self.device, non_blocking=use_pin)
+                targets = targets.to(self.device, non_blocking=use_pin)
+
+                if self.device.type == 'cuda':
+                    inputs = inputs.to(memory_format=torch.channels_last)
+                    targets = targets.to(memory_format=torch.channels_last)
 
                 optimizer.zero_grad(set_to_none=True)
 
-                with torch.amp.autocast("cuda"):
+                # Forward Pass + Loss Calculation
+                with amp_context:
                     outputs = self.netG(inputs)
-
-                    # --- NOUVELLE FORMULE DE LOSS ---
                     loss_l1_val = criterion_l1(outputs, targets)
                     loss_vgg_val = criterion_vgg(outputs, targets)
-
-                    # Formule magique : Structure (L1) + Texture (VGG)
-                    # On met un poids fort sur L1 pour garder la pose correcte
+                    # Formule : 10*L1 + 0.5*VGG
                     loss = 10.0 * loss_l1_val + 0.5 * loss_vgg_val
 
+                # Backward Pass
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
@@ -669,12 +662,14 @@ class GenVanillaNN:
             val_loss = 0.0
             with torch.no_grad():
                 for inputs, targets in val_loader:
-                    inputs = inputs.to(self.device, non_blocking=True, memory_format=torch.channels_last)
-                    targets = targets.to(self.device, non_blocking=True, memory_format=torch.channels_last)
+                    inputs = inputs.to(self.device, non_blocking=use_pin)
+                    targets = targets.to(self.device, non_blocking=use_pin)
+                    if self.device.type == 'cuda':
+                        inputs = inputs.to(memory_format=torch.channels_last)
+                        targets = targets.to(memory_format=torch.channels_last)
 
-                    with torch.amp.autocast("cuda"):
+                    with amp_context:
                         outputs = self.netG(inputs)
-                        # On valide avec la même métrique
                         l1 = criterion_l1(outputs, targets)
                         vgg = criterion_vgg(outputs, targets)
                         loss = 10.0 * l1 + 0.5 * vgg
@@ -684,7 +679,7 @@ class GenVanillaNN:
             avg_val_loss = val_loss / len(val_loader)
             scheduler.step(avg_val_loss)
 
-            # --- VISU: Sauvegarde de l'image témoin TOUTES LES 2 EPOCHS (Comme tu voulais) ---
+            # Sauvegarde d'une image témoin tous les 2 epochs
             if (epoch + 1) % 2 == 0:
                 with torch.no_grad():
                     fake_img_tensor = self.netG(fixed_ske)
@@ -695,6 +690,7 @@ class GenVanillaNN:
                     print(f"  [Disk] Image sauvegardée : {filename}")
             # ---------------------------------------------------------
 
+            # Sauvegarde du modèle si meilleur
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
                 torch.save(self.netG.state_dict(), self.filename)
@@ -756,9 +752,9 @@ class GenVanillaNN:
         cv2.destroyAllWindows()
 
 
+
+
 if __name__ == "__main__":
-
     video_file = "../data/raw/taichi1.mp4"
-
     # test alignement skeleton avec crop_ratio 1.3
-    GenVanillaNN.verify_alignment(video_file, crop_ratio=1.3,)
+    GenVanillaNN.verify_alignment(video_file, crop_ratio=1.3)

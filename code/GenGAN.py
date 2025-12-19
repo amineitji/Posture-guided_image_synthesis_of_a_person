@@ -1,4 +1,5 @@
 import os
+import contextlib  # Nécessaire pour gérer le contexte CPU/GPU
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
@@ -11,11 +12,36 @@ from GenVanillaNN import GenNNSkeImToImage, VideoSkeletonDataset, SkeToImageTran
 from torch.utils.data import DataLoader, Dataset
 
 # ============================================================
-#  🚀 OPTIMISATIONS RTX 4000 (TF32 & BENCHMARK)
+#         OPTIMISATIONS RTX 4000 & HYBRIDE CPU/GPU
 # ============================================================
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cudnn.benchmark = True
+
+# On détecte si le GPU est dispo AVANT d'appliquer les optimisations
+use_cuda = torch.cuda.is_available()
+
+if use_cuda:
+    # Optimisations spécifiques RTX (TF32 & Benchmark)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    print(f"[INIT] Mode GPU activé (Optimisations RTX 4000)")
+else:
+    print(f"[INIT] Mode CPU activé (Optimisations GPU désactivées)")
+
+
+# ============================================================
+# UTILS POUR LA COMPATIBILITÉ CPU
+# ============================================================
+class CpuScaler:
+    """Classe 'Fake' qui imite le GradScaler pour le CPU (ne fait rien)"""
+
+    def scale(self, loss):
+        return loss
+
+    def step(self, optimizer):
+        optimizer.step()
+
+    def update(self):
+        pass
 
 
 # ============================================================
@@ -33,7 +59,7 @@ class SelfAttention(nn.Module):
     def forward(self, x):
         B, C, H, W = x.size()
 
-        # CORRECTION : Utilisation de .reshape() au lieu de .view()
+        # Utilisation de .reshape() au lieu de .view()
         # Cela permet de gérer le format channels_last
         proj_query = self.query(x).reshape(B, -1, H * W).permute(0, 2, 1)
         proj_key = self.key(x).reshape(B, -1, H * W)
@@ -45,7 +71,7 @@ class SelfAttention(nn.Module):
 
         out = torch.bmm(proj_value, attention.permute(0, 2, 1))
 
-        # CORRECTION : Ici aussi, .reshape() pour remettre en forme
+        # Ici aussi, .reshape() pour remettre en forme
         out = out.reshape(B, C, H, W)
 
         out = self.gamma * out + x
@@ -165,7 +191,7 @@ class RAMDataset(Dataset):
 
 
 # ============================================================
-#               FONCTION D'INITIALISATION (AJOUTÉE)
+#               FONCTION D'INITIALISATION
 # ============================================================
 def weights_init(m):
     """
@@ -187,20 +213,31 @@ def weights_init(m):
 
 
 # ============================================================
-#                        WGAN-GP OPTIMISÉ
+#                        WGAN-GP OPTIMISÉ (HYBRIDE)
 # ============================================================
 
 class GenGAN():
     def __init__(self, videoSke, loadFromFile=False):
+        # Détection automatique du device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.image_size = 128
 
-        print(f"[GPU] {self.device} (Optimisé Channels Last)")
+        print(f"[DEVICE] Utilisation de : {self.device}")
+        if self.device.type == 'cuda':
+            print("       (Optimisé Channels Last activé)")
 
         # --- 1. Modèles ---
-        # Passage en Channels Last pour RTX
-        self.netG = GenNNSkeImToImage().to(self.device, memory_format=torch.channels_last)
-        self.netD = Discriminator().to(self.device, memory_format=torch.channels_last)
+        self.netG = GenNNSkeImToImage()
+        self.netD = Discriminator()
+
+        # Passage en Channels Last pour RTX UNIQUEMENT SI CUDA
+        if self.device.type == 'cuda':
+            self.netG = self.netG.to(memory_format=torch.channels_last)
+            self.netD = self.netD.to(memory_format=torch.channels_last)
+
+        # Envoi sur le device
+        self.netG = self.netG.to(self.device)
+        self.netD = self.netD.to(self.device)
 
         # Initialisation
         self.netG.apply(weights_init)
@@ -240,6 +277,8 @@ class GenGAN():
     def compute_gradient_penalty(self, real, fake):
         real = real.float()
         fake = fake.float()
+
+        # On s'assure que alpha est sur le bon device
         alpha = torch.rand(real.size(0), 1, 1, 1, device=self.device)
 
         # L'interpolation garde le format channels_last si real/fake le sont
@@ -258,7 +297,7 @@ class GenGAN():
             only_inputs=True,
         )[0]
 
-        # CORRECTION : .reshape() au lieu de .view() car gradients est en channels_last
+        #  .reshape() au lieu de .view() car gradients est en channels_last
         gradients = gradients.reshape(gradients.size(0), -1)
 
         penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
@@ -268,13 +307,16 @@ class GenGAN():
         # --- CONFIGURATION HYPER-PARAMÈTRES ---
         batch_size = 64
         lr = 0.0001
-        n_critic = 4  # Le Discriminateur s'entraîne 3 fois plus que le Générateur
+        n_critic = 4  # Le Discriminateur s'entraîne 4 fois plus que le Générateur
         lambda_gp = 10  # Force de la pénalité de gradient (Standard WGAN-GP)
 
         # --- DATALOADER ---
+        # pin_memory n'est utile que si on a un GPU
+        use_pin = (self.device.type == 'cuda')
+
         dataloader = DataLoader(
             self.dataset, batch_size=batch_size, shuffle=True,
-            num_workers=0, pin_memory=True
+            num_workers=0, pin_memory=use_pin
         )
         total_batches = len(dataloader)
 
@@ -284,7 +326,14 @@ class GenGAN():
 
         criterion_L1 = nn.L1Loss()
         criterion_VGG = VGGPerceptualLoss().to(self.device)
-        scaler = torch.cuda.amp.GradScaler()
+
+        # --- CONFIGURATION MIXED PRECISION (HYBRIDE) ---
+        if self.device.type == 'cuda':
+            scaler = torch.cuda.amp.GradScaler()
+            amp_context = torch.amp.autocast("cuda")
+        else:
+            scaler = CpuScaler()
+            amp_context = contextlib.nullcontext()
 
         print(f"[TRAIN] Démarrage WGAN-GP sur {self.device}...")
         print(f"        Images: {len(self.dataset)} | Batchs: {total_batches}")
@@ -296,7 +345,9 @@ class GenGAN():
         data_iter = iter(dataloader)
         first_batch = next(data_iter)
         # On garde les 5 premiers squelettes. .clone() protège les données.
-        fixed_ske = first_batch[0][:5].to(self.device, memory_format=torch.channels_last).clone()
+        fixed_ske = first_batch[0][:5].to(self.device, non_blocking=use_pin).clone()
+        if self.device.type == 'cuda':
+            fixed_ske = fixed_ske.to(memory_format=torch.channels_last)
         # ============================================================
 
         # --- BOUCLE D'ENTRAÎNEMENT ---
@@ -304,23 +355,30 @@ class GenGAN():
             for i, (ske, real) in enumerate(dataloader):
 
                 # Optimisation mémoire
-                ske = ske.to(self.device, non_blocking=True, memory_format=torch.channels_last)
-                real = real.to(self.device, non_blocking=True, memory_format=torch.channels_last)
+                ske = ske.to(self.device, non_blocking=use_pin)
+                real = real.to(self.device, non_blocking=use_pin)
+
+                # Optimisation Channels Last (GPU Seulement)
+                if self.device.type == 'cuda':
+                    ske = ske.to(memory_format=torch.channels_last)
+                    real = real.to(memory_format=torch.channels_last)
 
                 # ---------------------------------------
                 #  ETAPE 1 : ENTRAÎNEMENT DU DISCRIMINATOR
                 # ---------------------------------------
                 optimizerD.zero_grad(set_to_none=True)
 
-                with torch.cuda.amp.autocast():
+                with amp_context:
                     fake = self.netG(ske).detach()  # .detach() pour ne pas toucher au Générateur
                     d_real = self.netD(real)
                     d_fake = self.netD(fake)
                     d_loss_adv = -torch.mean(d_real) + torch.mean(d_fake)
 
-                # Calcul de la pénalité de gradient (cœur du WGAN-GP)
-                gp = self.compute_gradient_penalty(real, fake) * lambda_gp
-                d_loss = d_loss_adv + gp
+                    # Calcul de la pénalité de gradient (cœur du WGAN-GP)
+                    # GP est calculé hors autocast généralement ou géré par autograd
+                    # Ici on reste simple, si ça plante sur CPU on peut désactiver le GP ou le simplifier
+                    gp = self.compute_gradient_penalty(real, fake) * lambda_gp
+                    d_loss = d_loss_adv + gp
 
                 scaler.scale(d_loss).backward()
                 scaler.step(optimizerD)
@@ -332,7 +390,7 @@ class GenGAN():
                 if i % n_critic == 0:
                     optimizerG.zero_grad(set_to_none=True)
 
-                    with torch.cuda.amp.autocast():
+                    with amp_context:
                         fake = self.netG(ske)
                         d_fake = self.netD(fake)
 
@@ -341,13 +399,13 @@ class GenGAN():
                         g_loss_l1 = criterion_L1(fake, real)  # Ressembler aux pixels réels
                         g_loss_vgg = criterion_VGG(fake, real)  # Avoir la même texture (Perceptuel)
 
-                        # Poids des pertes : Adv=2, L1=10, VGG=0.3
+                        # Poids des pertes : Adv=3, L1=8, VGG=0.3
                         g_loss = 3 * g_loss_adv + 8.0 * g_loss_l1 + 0.3 * g_loss_vgg
 
                     scaler.scale(g_loss).backward()
                     scaler.step(optimizerG)
 
-                    # --- Print Propre ---
+                    # --- Print  ---
                     print(
                         f"\r[Ep {epoch + 1}/{n_epochs}] [Bt {i + 1}/{total_batches}] "
                         f"D: {d_loss.item():.4f} | G: {g_loss.item():.4f}",
@@ -356,7 +414,7 @@ class GenGAN():
 
                 scaler.update()
 
-            # Fin de l'époque : saut de ligne
+            # Fin de l'époque
             print()
 
             # ============================================================
@@ -394,9 +452,13 @@ class GenGAN():
             else:
                 ske = ske.unsqueeze(0).to(self.device)
 
-            ske = ske.to(memory_format=torch.channels_last)
+            if self.device.type == 'cuda':
+                ske = ske.to(memory_format=torch.channels_last)
 
-            with torch.cuda.amp.autocast():
+            # Contexte Autocast Hybride
+            ctx = torch.amp.autocast("cuda") if self.device.type == 'cuda' else contextlib.nullcontext()
+
+            with ctx:
                 fake = self.netG(ske)[0]
 
             # Tensor (RGB) -> Numpy (RGB)
@@ -404,7 +466,7 @@ class GenGAN():
             img = ((img * 0.5 + 0.5).clip(0, 1) * 255).astype("uint8")
 
             # CORRECTION COULEUR ICI
-            # On convertit explicitement RGB -> BGR pour OpenCV
+            # On convertit  RGB -> BGR pour OpenCV
             # img[..., ::-1] inverse l'ordre des canaux (R,G,B -> B,G,R)
             img_bgr = img[..., ::-1].copy()
 

@@ -150,7 +150,7 @@ def step_train():
     print("\n[CHOIX DU MODELE]")
     print(" 1. Vanilla NN (Vecteur) : Rapide, mais résultats flous/abstraits.")
     print(" 2. Vanilla NN (U-Net)   : Meilleur que le vecteur, traite les images.")
-    print(" 3. WGAN-GP (Pix2Pix)    : [RECOMMANDÉ] Le plus réaliste et net.")
+    print(" 3. WGAN-GP (Pix2Pix)    : Le plus réaliste et net.")
     
     type_model = input("\n> Modèle (1-3) : ")
     epochs = input("> Nombre d'epochs (défaut 200, recomm. 500+) : ") or "200"
@@ -210,10 +210,10 @@ def step_demo():
 
     print("\n[TYPE DE GENERATEUR]")
     print("Attention : Choisissez le même type que celui utilisé lors de l'entraînement !")
-    print(" 1. Nearest Neighbor (Pas d'IA, copie l'image la plus proche)")
+    print(" 1. Nearest Neighbor ")
     print(" 2. Vanilla NN (Vecteur)")
     print(" 3. Vanilla NN (U-Net)")
-    print(" 4. WGAN-GP (Si vous avez entraîné l'option 3)")
+    print(" 4. WGAN-GP")
     
     gen_type = input("\n> Choix (1-4, défaut 4) : ") or "4"
 

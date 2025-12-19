@@ -1,2 +1,9 @@
-/models/*
-/data/processed/*
+
+/bon model/test123.pth
+/dernier model/DanceGenVanillaFromSke26.pth
+/dernier model/latest_D.pth
+/dernier model/latest_G.pth
+/dernier model/test.pth
+/dernier model/test123.pth
+/test123.pth
+/data/

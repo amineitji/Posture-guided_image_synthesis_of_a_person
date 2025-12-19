@@ -264,10 +264,10 @@ Il suffit d'ouvrir un terminal à la racine du projet et d'exécuter la commande
 Une fois le script lancé, suivez simplement les instructions à l'écran. Le menu vous guidera à travers les étapes suivantes :
 
 1. **Préparation** :
-   Si votre vidéo n'est pas celle par défaut (`taichi1`), choisissez cette option pour extraire les squelettes et créer le dataset `.pkl`.
+   Si votre vidéo n'est pas celle par défaut (`taichi1`), choisissez cette option pour extraire les squelettes/images et créer le dataset `.pkl`.
 
 2. **Entraînement** :
-   Choisissez votre dataset et le type de générateur souhaité (**Vanilla** ou **GAN**).
+   Choisissez votre dataset et le type de générateur souhaité
 
 3. **Génération (Démo)** :
    Choisissez une **vidéo source** (qui donne le mouvement), le **personnage cible** (`taichi1.pkl` ou le vôtre) et le **générateur correspondant** pour visualiser le résultat final.
